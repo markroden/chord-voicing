@@ -15,7 +15,8 @@ class TTSGenerator:
         self,
         cache_dir: str | Path = "cache",
         rate: int = 175,
-        volume: float = 1.0
+        volume: float = 1.0,
+        voice_id: Optional[str] = None
     ):
         """
         Initialize the TTS generator.
@@ -24,12 +25,15 @@ class TTSGenerator:
             cache_dir: Directory to cache generated audio clips
             rate: Speech rate (words per minute, default 175)
             volume: Volume level 0.0 to 1.0
+            voice_id: Voice ID to use (e.g., 'com.apple.voice.compact.en-US.Samantha')
+                      If None, uses system default
         """
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         self.rate = rate
         self.volume = volume
+        self.voice_id = voice_id
         self._engine: Optional[pyttsx3.Engine] = None
         self._clip_cache: Dict[str, AudioSegment] = {}
 
@@ -38,12 +42,15 @@ class TTSGenerator:
         engine = pyttsx3.init()
         engine.setProperty('rate', self.rate)
         engine.setProperty('volume', self.volume)
+        if self.voice_id:
+            engine.setProperty('voice', self.voice_id)
         return engine
 
     def _get_cache_path(self, text: str) -> Path:
         """Get the cache file path for a given text."""
         # Create a hash of the text and settings for unique filename
-        settings_str = f"{text}_{self.rate}_{self.volume}"
+        voice_str = self.voice_id or "default"
+        settings_str = f"{text}_{self.rate}_{self.volume}_{voice_str}"
         hash_val = hashlib.md5(settings_str.encode()).hexdigest()[:12]
         safe_name = "".join(c if c.isalnum() else "_" for c in text[:20])
         # Use .aiff extension since pyttsx3 on macOS outputs AIFF-C format
@@ -150,3 +157,42 @@ class TTSGenerator:
         if self._engine is not None:
             self._engine.stop()
             self._engine = None
+
+
+def get_available_voices() -> list:
+    """Get list of available TTS voices.
+
+    Returns:
+        List of dicts with 'id' and 'name' for each voice
+    """
+    engine = pyttsx3.init()
+    voices = engine.getProperty('voices')
+    result = [{'id': v.id, 'name': v.name} for v in voices]
+    engine.stop()
+    return result
+
+
+def get_english_voices() -> list:
+    """Get list of English TTS voices.
+
+    Returns:
+        List of dicts with 'id' and 'name' for each English voice
+    """
+    voices = get_available_voices()
+    english_voices = []
+    for v in voices:
+        # Filter for English voices
+        vid = v['id'].lower()
+        if 'en-us' in vid or 'en-gb' in vid or 'en-au' in vid or 'en-' in vid:
+            english_voices.append(v)
+        elif any(name in v['name'].lower() for name in ['samantha', 'daniel', 'fred', 'karen', 'moira', 'tessa', 'rishi']):
+            english_voices.append(v)
+    return english_voices
+
+
+# Some good default voice IDs for macOS
+VOICE_SAMANTHA = 'com.apple.voice.compact.en-US.Samantha'  # Female, American
+VOICE_DANIEL = 'com.apple.voice.compact.en-GB.Daniel'  # Male, British
+VOICE_KAREN = 'com.apple.voice.compact.en-AU.Karen'  # Female, Australian
+VOICE_FRED = 'com.apple.speech.synthesis.voice.Fred'  # Male, classic Mac
+VOICE_MOIRA = 'com.apple.voice.compact.en-IE.Moira'  # Female, Irish

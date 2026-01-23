@@ -78,14 +78,18 @@ class AudioMixer:
         last_voice_end = -self.min_gap_seconds * 1000  # Start with negative to allow first chord
 
         for event in chord_events:
-            # Convert chord symbol to spoken text
-            spoken_text = format_chord(event.chord_name)
-            if not spoken_text:
-                continue  # Skip "N" (no chord) or unparseable chords
+            # First check if chord_name is directly in tts_clips (for notes/custom text)
+            if event.chord_name in tts_clips:
+                spoken_text = event.chord_name
+            else:
+                # Convert chord symbol to spoken text
+                spoken_text = format_chord(event.chord_name)
+                if not spoken_text:
+                    continue  # Skip "N" (no chord) or unparseable chords
 
-            # Check if we have a clip for this chord
-            if spoken_text not in tts_clips:
-                continue
+                # Check if we have a clip for this chord
+                if spoken_text not in tts_clips:
+                    continue
 
             clip = tts_clips[spoken_text]
 

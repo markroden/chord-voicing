@@ -1049,14 +1049,16 @@ class ChordEditor:
 
         try:
             from .chord_formatter import format_chord
-            from .tts_generator import TTSGenerator
+            from .tts_generator import TTSGenerator, VOICE_SAMANTHA, VOICE_DANIEL
             import tempfile
             import os
 
-            tts = TTSGenerator(cache_dir="cache", rate=175)
+            # Use different voices for chords vs notes
+            chord_tts = TTSGenerator(cache_dir="cache", rate=175, voice_id=VOICE_SAMANTHA)
+            note_tts = TTSGenerator(cache_dir="cache", rate=175, voice_id=VOICE_DANIEL)
             temp_dir = tempfile.mkdtemp()
 
-            # Load chord TTS clips
+            # Load chord TTS clips (Samantha voice - female)
             unique_chord_names = set(c.chord_name for c in self.chords)
             self._tts_clips = {}
 
@@ -1064,18 +1066,18 @@ class ChordEditor:
                 spoken = format_chord(chord_name)
                 if not spoken:
                     continue
-                clip = tts.generate_clip(spoken)
+                clip = chord_tts.generate_clip(spoken)
                 safe_name = chord_name.replace('/', '_').replace('#', 'sharp')
                 temp_path = os.path.join(temp_dir, f"chord_{safe_name}.wav")
                 clip.export(temp_path, format="wav")
                 self._tts_clips[chord_name] = pygame.mixer.Sound(temp_path)
 
-            # Load note TTS clips
+            # Load note TTS clips (Daniel voice - male, British)
             unique_note_texts = set(n.text for n in self.notes)
             self._note_clips = {}
 
             for note_text in unique_note_texts:
-                clip = tts.generate_clip(note_text)
+                clip = note_tts.generate_clip(note_text)
                 safe_name = "".join(c if c.isalnum() else '_' for c in note_text[:20])
                 temp_path = os.path.join(temp_dir, f"note_{safe_name}.wav")
                 clip.export(temp_path, format="wav")
@@ -1115,10 +1117,10 @@ class ChordEditor:
             self._note_clips[note.text].play()
 
     def _load_single_tts(self, chord_name: str):
-        """Load TTS clip for a single chord name."""
+        """Load TTS clip for a single chord name (Samantha voice)."""
         try:
             from .chord_formatter import format_chord
-            from .tts_generator import TTSGenerator
+            from .tts_generator import TTSGenerator, VOICE_SAMANTHA
             import tempfile
             import os
 
@@ -1126,7 +1128,7 @@ class ChordEditor:
             if not spoken:
                 return
 
-            tts = TTSGenerator(cache_dir="cache", rate=175)
+            tts = TTSGenerator(cache_dir="cache", rate=175, voice_id=VOICE_SAMANTHA)
             clip = tts.generate_clip(spoken)
 
             temp_dir = tempfile.mkdtemp()
@@ -1138,13 +1140,13 @@ class ChordEditor:
             print(f"Failed to load TTS for chord {chord_name}: {e}")
 
     def _load_single_note_tts(self, note_text: str):
-        """Load TTS clip for a single note text."""
+        """Load TTS clip for a single note text (Daniel voice)."""
         try:
-            from .tts_generator import TTSGenerator
+            from .tts_generator import TTSGenerator, VOICE_DANIEL
             import tempfile
             import os
 
-            tts = TTSGenerator(cache_dir="cache", rate=175)
+            tts = TTSGenerator(cache_dir="cache", rate=175, voice_id=VOICE_DANIEL)
             clip = tts.generate_clip(note_text)
 
             temp_dir = tempfile.mkdtemp()
@@ -1217,7 +1219,7 @@ class ChordEditor:
 
             try:
                 from .chord_formatter import format_chord
-                from .tts_generator import TTSGenerator
+                from .tts_generator import TTSGenerator, VOICE_SAMANTHA, VOICE_DANIEL
                 from .audio_mixer import AudioMixer
 
                 # Convert chords to ChordEvents
@@ -1230,33 +1232,34 @@ class ChordEditor:
                         chord_name=c.chord_name
                     ))
 
-                # Add notes as ChordEvents (using note text as "chord name")
+                # Add notes as ChordEvents (using note text directly as "chord name")
                 for note in self.notes:
-                    # Use a special prefix to distinguish notes
                     events.append(ChordEvent(
                         start_time=note.start_time,
                         end_time=note.start_time + 1.0,  # Notes don't have end times
-                        chord_name=f"__note__{note.text}"
+                        chord_name=note.text  # Use text directly - mixer will find it in tts_clips
                     ))
 
                 # Sort all events by start time
                 events.sort(key=lambda e: e.start_time)
 
-                # Generate TTS clips for chords
-                tts = TTSGenerator(cache_dir="cache", rate=175)
+                # Generate TTS clips for chords (Samantha voice)
+                # Key must be the SPOKEN text since that's what audio_mixer looks up
+                chord_tts = TTSGenerator(cache_dir="cache", rate=175, voice_id=VOICE_SAMANTHA)
+                note_tts = TTSGenerator(cache_dir="cache", rate=175, voice_id=VOICE_DANIEL)
                 tts_clips = {}
 
                 for chord in self.chords:
-                    if chord.chord_name not in tts_clips:
-                        spoken = format_chord(chord.chord_name)
-                        if spoken:
-                            tts_clips[chord.chord_name] = tts.generate_clip(spoken)
+                    spoken = format_chord(chord.chord_name)
+                    if spoken and spoken not in tts_clips:
+                        tts_clips[spoken] = chord_tts.generate_clip(spoken)
 
-                # Generate TTS clips for notes
+                # Generate TTS clips for notes (Daniel voice)
+                # Notes use the raw text as both the chord_name and spoken form
                 for note in self.notes:
-                    key = f"__note__{note.text}"
-                    if key not in tts_clips:
-                        tts_clips[key] = tts.generate_clip(note.text)
+                    # The note text IS the spoken text
+                    if note.text not in tts_clips:
+                        tts_clips[note.text] = note_tts.generate_clip(note.text)
 
                 # Mix audio
                 mixer = AudioMixer()
