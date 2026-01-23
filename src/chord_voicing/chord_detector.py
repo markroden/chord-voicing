@@ -93,16 +93,19 @@ def _match_chord(chroma_vector: np.ndarray, major_bias: float = 0.15) -> str:
 class ChordDetectorLibrosa:
     """Chord detector using librosa's chroma features (no VAMP required)."""
 
-    def __init__(self, hop_length: int = 2048, frame_length: float = 0.5):
+    def __init__(self, hop_length: int = 2048, frame_length: float = 1.0,
+                 min_chord_duration: float = 0.5):
         """
         Initialize the librosa-based chord detector.
 
         Args:
             hop_length: Hop length for chroma calculation
-            frame_length: Length of each analysis frame in seconds
+            frame_length: Length of each analysis frame in seconds (longer = more stable)
+            min_chord_duration: Minimum chord duration in seconds (filter noise)
         """
         self.hop_length = hop_length
         self.frame_length = frame_length
+        self.min_chord_duration = min_chord_duration
 
     def detect(self, audio_path: str | Path) -> List[ChordEvent]:
         """Detect chords using librosa chroma features."""
@@ -116,8 +119,14 @@ class ChordDetectorLibrosa:
         y, sr = librosa.load(str(audio_path), sr=22050)
         duration = len(y) / sr
 
-        # Calculate chroma features
-        chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=self.hop_length)
+        # Calculate chroma features with harmonic component only
+        # This helps filter out percussion/noise
+        y_harmonic = librosa.effects.harmonic(y)
+        chroma = librosa.feature.chroma_cqt(y=y_harmonic, sr=sr, hop_length=self.hop_length)
+
+        # Apply median filtering to smooth chroma features
+        from scipy.ndimage import median_filter
+        chroma = median_filter(chroma, size=(1, 9))
 
         # Calculate frame times
         frame_times = librosa.frames_to_time(
@@ -129,9 +138,8 @@ class ChordDetectorLibrosa:
         # Group frames into larger segments for more stable detection
         segment_samples = int(self.frame_length * sr / self.hop_length)
 
-        events = []
+        raw_events = []
         prev_chord = None
-        segment_start = 0.0
 
         for i in range(0, chroma.shape[1], segment_samples):
             end_idx = min(i + segment_samples, chroma.shape[1])
@@ -142,21 +150,21 @@ class ChordDetectorLibrosa:
 
             if chord != prev_chord and prev_chord is not None:
                 # End the previous chord
-                if events:
-                    events[-1] = ChordEvent(
-                        start_time=events[-1].start_time,
+                if raw_events:
+                    raw_events[-1] = ChordEvent(
+                        start_time=raw_events[-1].start_time,
                         end_time=current_time,
-                        chord_name=events[-1].chord_name
+                        chord_name=raw_events[-1].chord_name
                     )
                 # Start new chord
                 if chord != 'N':
-                    events.append(ChordEvent(
+                    raw_events.append(ChordEvent(
                         start_time=current_time,
                         end_time=duration,
                         chord_name=chord
                     ))
             elif prev_chord is None and chord != 'N':
-                events.append(ChordEvent(
+                raw_events.append(ChordEvent(
                     start_time=current_time,
                     end_time=duration,
                     chord_name=chord
@@ -164,10 +172,113 @@ class ChordDetectorLibrosa:
 
             prev_chord = chord
 
+        # Filter out very short chords (likely noise)
+        events = []
+        for event in raw_events:
+            if event.duration >= self.min_chord_duration:
+                events.append(event)
+            elif events:
+                # Extend the previous chord instead
+                events[-1] = ChordEvent(
+                    start_time=events[-1].start_time,
+                    end_time=event.end_time,
+                    chord_name=events[-1].chord_name
+                )
+
         return events
 
     def detect_with_duration(self, audio_path: str | Path, audio_duration: float) -> List[ChordEvent]:
         """Detect chords with accurate end time for the last chord."""
+        events = self.detect(audio_path)
+        if events:
+            events[-1] = ChordEvent(
+                start_time=events[-1].start_time,
+                end_time=audio_duration,
+                chord_name=events[-1].chord_name
+            )
+        return events
+
+
+class ChordDetectorEssentia:
+    """Chord detector using Essentia (works on M1 Mac)."""
+
+    def __init__(self, frame_size: int = 8192, hop_size: int = 4096,
+                 min_chord_duration: float = 0.3):
+        self.frame_size = frame_size
+        self.hop_size = hop_size
+        self.min_chord_duration = min_chord_duration
+
+    def detect(self, audio_path: str | Path) -> List[ChordEvent]:
+        """Detect chords using Essentia's HPCP + ChordsDetection."""
+        import essentia.standard as es
+
+        audio_path = Path(audio_path)
+        if not audio_path.exists():
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+
+        # Load audio
+        sr = 44100
+        audio = es.MonoLoader(filename=str(audio_path), sampleRate=sr)()
+        duration = len(audio) / sr
+
+        # Setup algorithms
+        w = es.Windowing(type='blackmanharris62')
+        spectrum = es.Spectrum()
+        peaks = es.SpectralPeaks(
+            orderBy='magnitude',
+            magnitudeThreshold=0.0001,
+            minFrequency=40,
+            maxFrequency=5000,
+            maxPeaks=100
+        )
+        hpcp = es.HPCP(size=36, harmonics=8, windowSize=1.0)
+        chords_algo = es.ChordsDetection(
+            hopSize=self.hop_size,
+            sampleRate=sr,
+            windowSize=2
+        )
+
+        # Compute HPCP frames
+        hpcp_frames = []
+        for frame in es.FrameGenerator(audio, frameSize=self.frame_size, hopSize=self.hop_size):
+            spec = spectrum(w(frame))
+            freqs, mags = peaks(spec)
+            h = hpcp(freqs, mags)
+            hpcp_frames.append(h)
+
+        hpcp_array = np.array(hpcp_frames)
+        chord_list, strength_list = chords_algo(hpcp_array)
+
+        # Group consecutive same chords
+        events = []
+        prev_chord = None
+        start_time = 0.0
+
+        for i, chord in enumerate(chord_list):
+            time = i * self.hop_size / sr
+            if chord != prev_chord:
+                if prev_chord is not None:
+                    chord_duration = time - start_time
+                    if chord_duration >= self.min_chord_duration:
+                        events.append(ChordEvent(
+                            start_time=start_time,
+                            end_time=time,
+                            chord_name=prev_chord
+                        ))
+                start_time = time
+                prev_chord = chord
+
+        # Add final chord
+        if prev_chord is not None:
+            events.append(ChordEvent(
+                start_time=start_time,
+                end_time=duration,
+                chord_name=prev_chord
+            ))
+
+        return events
+
+    def detect_with_duration(self, audio_path: str | Path, audio_duration: float) -> List[ChordEvent]:
         events = self.detect(audio_path)
         if events:
             events[-1] = ChordEvent(
@@ -231,15 +342,36 @@ class ChordDetector:
     Librosa fallback works out of the box but is less accurate.
     """
 
-    def __init__(self, prefer_librosa: bool = False):
+    def __init__(self, prefer_librosa: bool = False, frame_length: float = 1.0,
+                 min_chord_duration: float = 0.5, use_essentia: bool = True):
         """
         Initialize the chord detector.
 
         Args:
-            prefer_librosa: If True, always use librosa instead of trying Chordino
+            prefer_librosa: If True, always use librosa instead of trying other detectors
+            frame_length: Analysis frame length in seconds (for librosa fallback)
+            min_chord_duration: Minimum chord duration in seconds
+            use_essentia: If True, try Essentia before librosa (recommended for M1 Mac)
         """
         self._chordino_failed = False
+        self._essentia_failed = False
         self._prefer_librosa = prefer_librosa
+        self._use_essentia = use_essentia
+        self._frame_length = frame_length
+        self._min_chord_duration = min_chord_duration
+
+    def _try_essentia(self, audio_path: str | Path) -> Optional[List[ChordEvent]]:
+        """Try to detect chords using Essentia."""
+        if self._essentia_failed or self._prefer_librosa:
+            return None
+
+        try:
+            detector = ChordDetectorEssentia(min_chord_duration=self._min_chord_duration)
+            return detector.detect(audio_path)
+        except Exception as e:
+            self._essentia_failed = True
+            warnings.warn(f"Essentia unavailable ({e}), trying other methods.")
+            return None
 
     def _try_chordino(self, audio_path: str | Path) -> Optional[List[ChordEvent]]:
         """Try to detect chords using Chordino."""
@@ -260,13 +392,22 @@ class ChordDetector:
 
     def detect(self, audio_path: str | Path) -> List[ChordEvent]:
         """Detect chords in an audio file."""
-        # Try Chordino first
+        # Try Essentia first (best for M1 Mac)
+        if self._use_essentia:
+            result = self._try_essentia(audio_path)
+            if result is not None:
+                return result
+
+        # Try Chordino (requires VAMP plugins)
         result = self._try_chordino(audio_path)
         if result is not None:
             return result
 
         # Fall back to librosa
-        detector = ChordDetectorLibrosa()
+        detector = ChordDetectorLibrosa(
+            frame_length=self._frame_length,
+            min_chord_duration=self._min_chord_duration
+        )
         return detector.detect(audio_path)
 
     def detect_with_duration(self, audio_path: str | Path, audio_duration: float) -> List[ChordEvent]:

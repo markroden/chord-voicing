@@ -4,10 +4,13 @@ import argparse
 import sys
 from pathlib import Path
 
-from .chord_detector import ChordDetector
+from .chord_detector import ChordDetector, ChordEvent
 from .chord_formatter import format_chord, get_unique_chords
 from .tts_generator import TTSGenerator
 from .audio_mixer import process_audio, AudioMixer
+from .chord_chart_parser import (
+    parse_chord_chart, load_chord_chart, create_chord_mapping, correct_chord
+)
 
 
 def main():
@@ -85,6 +88,26 @@ Examples:
     )
 
     parser.add_argument(
+        "--frame-length",
+        type=float,
+        default=1.0,
+        help="Chord detection frame length in seconds. Smaller = more responsive but noisier (default: 1.0)"
+    )
+
+    parser.add_argument(
+        "--min-chord-duration",
+        type=float,
+        default=0.5,
+        help="Minimum chord duration in seconds. Smaller = keep more chords (default: 0.5, use 0 for all)"
+    )
+
+    parser.add_argument(
+        "--chord-chart", "-c",
+        type=str,
+        help="Path to chord chart file (text format). Uses chart to correct AI-detected chords."
+    )
+
+    parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Show verbose output"
@@ -106,7 +129,10 @@ Examples:
         print("Detecting chords...")
 
     try:
-        detector = ChordDetector()
+        detector = ChordDetector(
+            frame_length=args.frame_length,
+            min_chord_duration=args.min_chord_duration
+        )
 
         # Get audio duration for accurate last chord end time
         mixer = AudioMixer()
@@ -124,6 +150,42 @@ Examples:
 
     if args.verbose:
         print(f"Detected {len(chord_events)} chord changes")
+
+    # Apply chord chart correction if provided
+    if args.chord_chart:
+        chart_path = Path(args.chord_chart)
+        if not chart_path.exists():
+            print(f"Error: Chord chart not found: {chart_path}", file=sys.stderr)
+            sys.exit(1)
+
+        if args.verbose:
+            print(f"Loading chord chart: {chart_path}")
+
+        try:
+            chart_text = load_chord_chart(str(chart_path))
+            chart_chords = parse_chord_chart(chart_text)
+            chord_mapping = create_chord_mapping(chart_chords)
+
+            if args.verbose:
+                print(f"Chart chords: {set(chart_chords)}")
+                print(f"Chord mapping: {chord_mapping}")
+
+            # Correct detected chords using the chart
+            corrected_events = []
+            for event in chord_events:
+                corrected_name = correct_chord(event.chord_name, chord_mapping)
+                corrected_events.append(ChordEvent(
+                    start_time=event.start_time,
+                    end_time=event.end_time,
+                    chord_name=corrected_name
+                ))
+            chord_events = corrected_events
+
+            if args.verbose:
+                print(f"Corrected chords using chart")
+
+        except Exception as e:
+            print(f"Warning: Could not parse chord chart: {e}", file=sys.stderr)
 
     # If just listing chords, print and exit
     if args.list_chords:
