@@ -1,0 +1,25 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Generated files
+cache/
+output/
+
+# Test files
+test_*.mp3
+test_*.aiff
+test_*.wav
+
+# OS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
