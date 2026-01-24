@@ -669,7 +669,8 @@ class ChordEditor:
 
     def _setup_bindings(self):
         """Setup keyboard bindings."""
-        self.root.bind('<space>', lambda e: self._toggle_play())
+        # Spacebar toggles play/pause globally
+        self.root.bind_all('<space>', self._on_space)
         self.root.bind('<a>', lambda e: self._add_chord())
         self.root.bind('<n>', lambda e: self._add_note())
         self.root.bind('<Delete>', lambda e: self._delete_selected())
@@ -722,6 +723,14 @@ class ChordEditor:
             try:
                 self.player.load(filepath)
                 self.audio_file = filepath
+
+                # Clear existing chords and notes
+                self.chords = []
+                self.notes = []
+                self.timeline.set_chords(self.chords)
+                self.timeline.set_notes(self.notes)
+                self._clear_selection_info()
+
                 self.timeline.set_duration(self.player.duration)
                 self.duration_var.set(self._format_duration(self.player.duration))
                 self._update_scrollbar()
@@ -764,7 +773,16 @@ class ChordEditor:
         self.next_id += 1
         return self.next_id
 
-    def _toggle_play(self):
+    def _on_space(self, event):
+        """Handle spacebar press - toggle play/pause unless in text entry."""
+        focused = str(self.root.focus_get())
+        # Allow space in entry widgets
+        if 'entry' in focused.lower():
+            return
+        self._toggle_play()
+        return "break"
+
+    def _toggle_play(self, event=None):
         """Toggle play/pause."""
         if self.player.is_playing():
             self.player.pause()
@@ -774,6 +792,8 @@ class ChordEditor:
                 # Always use play() with current position - unpause only works after pause
                 self.player.play(self.player.get_position())
                 self.play_btn.config(text="⏸ Pause")
+        # Return focus to timeline so spacebar keeps working
+        self.timeline.focus_set()
 
     def _stop(self):
         """Stop playback."""
@@ -1049,13 +1069,13 @@ class ChordEditor:
 
         try:
             from .chord_formatter import format_chord
-            from .tts_generator import TTSGenerator, VOICE_SAMANTHA, VOICE_DANIEL
+            from .tts_generator import TTSGenerator, VOICE_SAMANTHA, VOICE_MOIRA
             import tempfile
             import os
 
             # Use different voices for chords vs notes
             chord_tts = TTSGenerator(cache_dir="cache", rate=175, voice_id=VOICE_SAMANTHA)
-            note_tts = TTSGenerator(cache_dir="cache", rate=175, voice_id=VOICE_DANIEL)
+            note_tts = TTSGenerator(cache_dir="cache", rate=175, voice_id=VOICE_MOIRA)
             temp_dir = tempfile.mkdtemp()
 
             # Load chord TTS clips (Samantha voice - female)
@@ -1142,11 +1162,11 @@ class ChordEditor:
     def _load_single_note_tts(self, note_text: str):
         """Load TTS clip for a single note text (Daniel voice)."""
         try:
-            from .tts_generator import TTSGenerator, VOICE_DANIEL
+            from .tts_generator import TTSGenerator, VOICE_MOIRA
             import tempfile
             import os
 
-            tts = TTSGenerator(cache_dir="cache", rate=175, voice_id=VOICE_DANIEL)
+            tts = TTSGenerator(cache_dir="cache", rate=175, voice_id=VOICE_MOIRA)
             clip = tts.generate_clip(note_text)
 
             temp_dir = tempfile.mkdtemp()
@@ -1219,7 +1239,7 @@ class ChordEditor:
 
             try:
                 from .chord_formatter import format_chord
-                from .tts_generator import TTSGenerator, VOICE_SAMANTHA, VOICE_DANIEL
+                from .tts_generator import TTSGenerator, VOICE_SAMANTHA, VOICE_MOIRA
                 from .audio_mixer import AudioMixer
 
                 # Convert chords to ChordEvents
@@ -1246,7 +1266,7 @@ class ChordEditor:
                 # Generate TTS clips for chords (Samantha voice)
                 # Key must be the SPOKEN text since that's what audio_mixer looks up
                 chord_tts = TTSGenerator(cache_dir="cache", rate=175, voice_id=VOICE_SAMANTHA)
-                note_tts = TTSGenerator(cache_dir="cache", rate=175, voice_id=VOICE_DANIEL)
+                note_tts = TTSGenerator(cache_dir="cache", rate=175, voice_id=VOICE_MOIRA)
                 tts_clips = {}
 
                 for chord in self.chords:

@@ -196,3 +196,4 @@ VOICE_DANIEL = 'com.apple.voice.compact.en-GB.Daniel'  # Male, British
 VOICE_KAREN = 'com.apple.voice.compact.en-AU.Karen'  # Female, Australian
 VOICE_FRED = 'com.apple.speech.synthesis.voice.Fred'  # Male, classic Mac
 VOICE_MOIRA = 'com.apple.voice.compact.en-IE.Moira'  # Female, Irish
+VOICE_SHELLEY = 'com.apple.eloquence.en-US.Shelley'  # Warm, gentle
