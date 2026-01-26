@@ -146,8 +146,10 @@ class ChordTimeline(tk.Canvas):
         # Callbacks
         self.on_chord_selected: Optional[Callable] = None
         self.on_chord_moved: Optional[Callable] = None
+        self.on_chord_edited: Optional[Callable] = None
         self.on_note_selected: Optional[Callable] = None
         self.on_note_moved: Optional[Callable] = None
+        self.on_note_edited: Optional[Callable] = None
         self.on_seek: Optional[Callable] = None
         self.on_zoom_changed: Optional[Callable] = None
 
@@ -501,6 +503,9 @@ class ChordTimeline(tk.Canvas):
             if new_name:
                 chord.chord_name = new_name
                 self.redraw()
+                # Notify editor to load TTS for new chord
+                if self.on_chord_edited:
+                    self.on_chord_edited(new_name)
             return
 
         note = self._find_note_at(event.x, event.y)
@@ -510,6 +515,9 @@ class ChordTimeline(tk.Canvas):
             if new_text:
                 note.text = new_text
                 self.redraw()
+                # Notify editor to load TTS for new note
+                if self.on_note_edited:
+                    self.on_note_edited(new_text)
 
     def _on_resize(self, event):
         """Handle resize event."""
@@ -590,6 +598,7 @@ class ChordEditor:
         self.play_btn.pack(side=tk.LEFT, padx=5)
 
         ttk.Button(control_frame, text="⏹ Stop", command=self._stop).pack(side=tk.LEFT, padx=5)
+        ttk.Button(control_frame, text="🗑 Delete", command=self._delete_chord_at_playhead).pack(side=tk.LEFT, padx=5)
 
         ttk.Separator(control_frame, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
         self.preview_var = tk.BooleanVar(value=False)
@@ -630,8 +639,10 @@ class ChordEditor:
         self.timeline.pack(fill=tk.BOTH, expand=True)
         self.timeline.on_chord_selected = self._on_chord_selected
         self.timeline.on_chord_moved = self._on_chord_moved
+        self.timeline.on_chord_edited = self._on_chord_edited
         self.timeline.on_note_selected = self._on_note_selected
         self.timeline.on_note_moved = self._on_note_moved
+        self.timeline.on_note_edited = self._on_note_edited
         self.timeline.on_seek = self._on_seek
         self.timeline.on_zoom_changed = self._on_zoom_changed
 
@@ -662,6 +673,11 @@ class ChordEditor:
         ttk.Label(info_frame, text="Spoken:").grid(row=0, column=6, padx=5, pady=5)
         self.item_spoken_var = tk.StringVar()
         ttk.Label(info_frame, textvariable=self.item_spoken_var, width=15).grid(row=0, column=7, padx=5, pady=5)
+
+        # Quick-add chord buttons frame
+        self.chord_buttons_frame = ttk.LabelFrame(main_frame, text="Quick Add Chord")
+        self.chord_buttons_frame.pack(fill=tk.X, pady=(10, 0))
+        self._chord_buttons: list = []
 
         # Status bar
         self.status_var = tk.StringVar(value="Load an audio file to begin")
@@ -761,6 +777,7 @@ class ChordEditor:
                 ))
 
             self.timeline.set_chords(self.chords)
+            self._update_chord_buttons()
             self.status_var.set(f"Detected {len(self.chords)} chords")
             # Reload TTS clips if preview mode is enabled
             if self.preview_with_chords:
@@ -843,6 +860,17 @@ class ChordEditor:
         """Handle note moved."""
         self.item_time_var.set(f"{note.start_time:.2f}")
 
+    def _on_chord_edited(self, chord_name: str):
+        """Handle chord edited via double-click - load TTS for new name."""
+        if chord_name not in self._tts_clips:
+            self._load_single_tts(chord_name)
+        self._update_chord_buttons()
+
+    def _on_note_edited(self, note_text: str):
+        """Handle note edited via double-click - load TTS for new text."""
+        if note_text not in self._note_clips:
+            self._load_single_note_tts(note_text)
+
     def _update_selected_text(self, event=None):
         """Update text of selected chord or note."""
         new_text = self.item_text_var.get()
@@ -851,14 +879,15 @@ class ChordEditor:
             spoken = format_chord(new_text) or "(unknown)"
             self.item_spoken_var.set(spoken)
             self.timeline.redraw()
-            # Load TTS for new chord if preview is enabled
-            if self.preview_with_chords and new_text not in self._tts_clips:
+            # Always load TTS for new chord name
+            if new_text not in self._tts_clips:
                 self._load_single_tts(new_text)
+            self._update_chord_buttons()
         elif self.timeline.selected_note:
             self.timeline.selected_note.text = new_text
             self.timeline.redraw()
-            # Load TTS for new note if preview is enabled
-            if self.preview_with_chords and new_text not in self._note_clips:
+            # Always load TTS for new note text
+            if new_text not in self._note_clips:
                 self._load_single_note_tts(new_text)
 
     def _update_selected_time(self, event=None):
@@ -893,6 +922,7 @@ class ChordEditor:
         self.timeline.selected_chord = new_chord
         self.timeline.selected_note = None
         self._on_chord_selected(new_chord)
+        self._update_chord_buttons()
         self.status_var.set(f"Added chord at {pos:.2f}s")
         # Load TTS for new chord if preview is enabled and not already loaded
         if self.preview_with_chords and "C" not in self._tts_clips:
@@ -923,6 +953,7 @@ class ChordEditor:
             self.chords.remove(self.timeline.selected_chord)
             self.timeline.selected_chord = None
             self.timeline.set_chords(self.chords)
+            self._update_chord_buttons()
             self._clear_selection_info()
             self.status_var.set("Chord deleted")
         elif self.timeline.selected_note:
@@ -931,6 +962,26 @@ class ChordEditor:
             self.timeline.set_notes(self.notes)
             self._clear_selection_info()
             self.status_var.set("Note deleted")
+
+    def _delete_chord_at_playhead(self):
+        """Delete selected chord, or closest chord to playhead if none selected."""
+        # If a chord is selected, delete it
+        if self.timeline.selected_chord:
+            self._delete_selected()
+            return
+
+        # Otherwise find closest chord to playhead
+        if not self.chords:
+            self.status_var.set("No chords to delete")
+            return
+
+        pos = self.player.get_position()
+        closest = min(self.chords, key=lambda c: abs(c.start_time - pos))
+        self.chords.remove(closest)
+        self.timeline.set_chords(self.chords)
+        self._update_chord_buttons()
+        self._clear_selection_info()
+        self.status_var.set(f"Deleted {closest.chord_name} at {closest.start_time:.2f}s")
 
     def _copy_selected(self):
         """Copy selected chord or note."""
@@ -963,6 +1014,7 @@ class ChordEditor:
             self.chords.append(new_chord)
             self.chords.sort(key=lambda c: c.start_time)
             self.timeline.set_chords(self.chords)
+            self._update_chord_buttons()
             self.status_var.set(f"Pasted chord: {new_chord.chord_name} at {pos:.2f}s")
         elif self.clipboard_note:
             new_note = EditableNote(
@@ -1049,6 +1101,40 @@ class ChordEditor:
         """Scroll to center the playhead in view."""
         self.timeline.scroll_to_time(self.player.get_position())
         self._update_scrollbar()
+
+    def _update_chord_buttons(self):
+        """Update quick-add chord buttons based on unique chords in the song."""
+        # Clear existing buttons
+        for btn in self._chord_buttons:
+            btn.destroy()
+        self._chord_buttons.clear()
+
+        # Get unique chord names, sorted
+        unique_chords = sorted(set(c.chord_name for c in self.chords))
+
+        # Create a button for each chord
+        for chord_name in unique_chords:
+            btn = ttk.Button(
+                self.chord_buttons_frame,
+                text=chord_name,
+                command=lambda cn=chord_name: self._quick_add_chord(cn)
+            )
+            btn.pack(side=tk.LEFT, padx=2, pady=5)
+            self._chord_buttons.append(btn)
+
+    def _quick_add_chord(self, chord_name: str):
+        """Add a chord at the current playhead position."""
+        pos = self.player.get_position()
+        new_chord = EditableChord(start_time=pos, chord_name=chord_name, id=self._get_next_id())
+        self.chords.append(new_chord)
+        self.chords.sort(key=lambda c: c.start_time)
+        self.timeline.set_chords(self.chords)
+        self.timeline.selected_chord = new_chord
+        self._on_chord_selected(new_chord)
+        # Load TTS if needed
+        if chord_name not in self._tts_clips:
+            self._load_single_tts(chord_name)
+        self.status_var.set(f"Added {chord_name} at {pos:.2f}s")
 
     def _toggle_preview_mode(self):
         """Toggle chord preview mode."""
@@ -1184,9 +1270,11 @@ class ChordEditor:
 
     def _save_chords(self):
         """Save chords and notes to JSON file."""
+        initial_dir = Path(self.audio_file).parent if self.audio_file else None
         filepath = filedialog.asksaveasfilename(
             defaultextension=".json",
-            filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            initialdir=initial_dir
         )
         if filepath:
             data = {
@@ -1201,8 +1289,10 @@ class ChordEditor:
 
     def _load_chords(self):
         """Load chords and notes from JSON file."""
+        initial_dir = Path(self.audio_file).parent if self.audio_file else None
         filepath = filedialog.askopenfilename(
-            filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            initialdir=initial_dir
         )
         if filepath:
             try:
@@ -1219,6 +1309,7 @@ class ChordEditor:
 
                 self.timeline.set_chords(self.chords)
                 self.timeline.set_notes(self.notes)
+                self._update_chord_buttons()
                 self.status_var.set(f"Loaded {len(self.chords)} chords, {len(self.notes)} notes from {Path(filepath).name}")
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to load: {e}")
