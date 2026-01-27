@@ -164,6 +164,11 @@ class ChordTimeline(tk.Canvas):
         self._pan_start_x: float = 0
         self._pan_start_offset: float = 0
 
+        # Beat grid and snap
+        self.bpm: Optional[float] = None
+        self.show_grid: bool = True
+        self.snap_to_beat: bool = False
+
         # Bind events
         self.bind('<Button-1>', self._on_click)
         self.bind('<B1-Motion>', self._on_drag)
@@ -207,6 +212,18 @@ class ChordTimeline(tk.Canvas):
         """Set the notes to display."""
         self.notes = sorted(notes, key=lambda n: n.start_time)
         self.redraw()
+
+    def set_bpm(self, bpm: Optional[float]):
+        """Set the BPM for beat grid."""
+        self.bpm = bpm
+        self.redraw()
+
+    def snap_time_to_beat(self, time: float) -> float:
+        """Snap a time value to the nearest beat."""
+        if not self.bpm or not self.snap_to_beat:
+            return time
+        beat_duration = 60.0 / self.bpm
+        return round(time / beat_duration) * beat_duration
 
     def set_playhead(self, position: float, auto_scroll: bool = True):
         """Update playhead position."""
@@ -359,6 +376,23 @@ class ChordTimeline(tk.Canvas):
         width = self.winfo_width() or 800
         height = self.winfo_height() or 100
 
+        # Draw beat grid (if BPM is set and grid is enabled)
+        if self.bpm and self.show_grid:
+            beat_duration = 60.0 / self.bpm
+            measure_duration = beat_duration * 4  # Assume 4/4 time
+            t = 0
+            beat_num = 0
+            while t <= self.duration:
+                x = self._time_to_x(t)
+                if 0 <= x <= width:
+                    # Measure lines (every 4 beats) are brighter
+                    if beat_num % 4 == 0:
+                        self.create_line(x, 0, x, height, fill='#555555', width=1)
+                    else:
+                        self.create_line(x, 0, x, height, fill='#333333', width=1, dash=(2, 4))
+                t += beat_duration
+                beat_num += 1
+
         # Draw time grid
         grid_interval = self._get_grid_interval()
         t = 0
@@ -486,10 +520,16 @@ class ChordTimeline(tk.Canvas):
     def _on_release(self, event):
         """Handle release event."""
         if self._dragging:
-            if self._drag_chord and self.on_chord_moved:
-                self.on_chord_moved(self._drag_chord)
-            elif self._drag_note and self.on_note_moved:
-                self.on_note_moved(self._drag_note)
+            # Snap to beat if enabled
+            if self._drag_chord:
+                self._drag_chord.start_time = self.snap_time_to_beat(self._drag_chord.start_time)
+                if self.on_chord_moved:
+                    self.on_chord_moved(self._drag_chord)
+            elif self._drag_note:
+                self._drag_note.start_time = self.snap_time_to_beat(self._drag_note.start_time)
+                if self.on_note_moved:
+                    self.on_note_moved(self._drag_note)
+            self.redraw()
         self._dragging = False
         self._drag_chord = None
         self._drag_note = None
@@ -541,8 +581,13 @@ class ChordEditor:
         self.clipboard_chord: Optional[EditableChord] = None
         self.clipboard_note: Optional[EditableNote] = None
 
+        # BPM and key tracking
+        self.bpm: Optional[float] = None
+        self.estimated_key: Optional[str] = None
+        self.snap_to_beat: bool = False
+
         # Real-time chord/note preview
-        self.preview_with_chords: bool = False
+        self.preview_with_chords: bool = True
         self._tts_clips: dict = {}  # chord_name -> pygame.Sound
         self._note_clips: dict = {}  # note_text -> pygame.Sound
         self._announced_chords: set = set()  # chord IDs announced this playback
@@ -563,6 +608,7 @@ class ChordEditor:
         menubar.add_cascade(label="File", menu=file_menu)
         file_menu.add_command(label="Open Audio...", command=self._open_audio, accelerator="Cmd+O")
         file_menu.add_command(label="Load Chords...", command=self._load_chords)
+        file_menu.add_command(label="Load Chords from MIDI...", command=self._load_chords_from_midi)
         file_menu.add_command(label="Save Chords...", command=self._save_chords, accelerator="Cmd+S")
         file_menu.add_separator()
         file_menu.add_command(label="Export Voiced Audio...", command=self._export_audio)
@@ -601,7 +647,7 @@ class ChordEditor:
         ttk.Button(control_frame, text="🗑 Delete", command=self._delete_chord_at_playhead).pack(side=tk.LEFT, padx=5)
 
         ttk.Separator(control_frame, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
-        self.preview_var = tk.BooleanVar(value=False)
+        self.preview_var = tk.BooleanVar(value=True)
         self.preview_check = ttk.Checkbutton(
             control_frame, text="🔊 Hear Chords",
             variable=self.preview_var,
@@ -625,6 +671,37 @@ class ChordEditor:
         ttk.Label(control_frame, textvariable=self.zoom_var, width=6).pack(side=tk.LEFT, padx=5)
         ttk.Button(control_frame, text="+", width=3, command=self._zoom_in).pack(side=tk.LEFT)
         ttk.Button(control_frame, text="Fit", width=4, command=self._zoom_fit).pack(side=tk.LEFT, padx=(5, 0))
+
+        # BPM, Key, and Snap controls (second row)
+        info_control_frame = ttk.Frame(main_frame)
+        info_control_frame.pack(fill=tk.X, pady=(5, 5))
+
+        ttk.Label(info_control_frame, text="BPM:").pack(side=tk.LEFT, padx=(5, 2))
+        self.bpm_var = tk.StringVar(value="--")
+        self.bpm_entry = ttk.Entry(info_control_frame, textvariable=self.bpm_var, width=6)
+        self.bpm_entry.pack(side=tk.LEFT)
+        self.bpm_entry.bind('<Return>', self._on_bpm_change)
+        self.bpm_entry.bind('<FocusOut>', self._on_bpm_change)
+
+        ttk.Label(info_control_frame, text="Key:").pack(side=tk.LEFT, padx=(15, 2))
+        self.key_var = tk.StringVar(value="--")
+        ttk.Label(info_control_frame, textvariable=self.key_var, width=8).pack(side=tk.LEFT)
+
+        ttk.Separator(info_control_frame, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
+
+        self.snap_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            info_control_frame, text="Snap to Beat",
+            variable=self.snap_var,
+            command=self._toggle_snap
+        ).pack(side=tk.LEFT, padx=5)
+
+        self.grid_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            info_control_frame, text="Show Beat Grid",
+            variable=self.grid_var,
+            command=self._toggle_grid
+        ).pack(side=tk.LEFT, padx=5)
 
         # Timeline frame with scrollbar
         timeline_frame = ttk.Frame(main_frame)
@@ -1059,6 +1136,68 @@ class ChordEditor:
         self.timeline.zoom_to_fit()
         self._update_scrollbar()
 
+    def _on_bpm_change(self, event=None):
+        """Handle BPM entry change."""
+        try:
+            bpm_text = self.bpm_var.get().strip()
+            if bpm_text and bpm_text != "--":
+                self.bpm = float(bpm_text)
+                self.timeline.set_bpm(self.bpm)
+                self.timeline.redraw()
+        except ValueError:
+            pass  # Ignore invalid input
+
+    def _toggle_snap(self):
+        """Toggle snap to beat."""
+        self.snap_to_beat = self.snap_var.get()
+        self.timeline.snap_to_beat = self.snap_to_beat
+
+    def _toggle_grid(self):
+        """Toggle beat grid visibility."""
+        self.timeline.show_grid = self.grid_var.get()
+        self.timeline.redraw()
+
+    def _estimate_key(self):
+        """Estimate the musical key from chord roots."""
+        if not self.chords:
+            self.estimated_key = None
+            self.key_var.set("--")
+            return
+
+        from collections import Counter
+
+        # Extract root notes from chord names
+        roots = []
+        for chord in self.chords:
+            name = chord.chord_name
+            if not name:
+                continue
+            # Get root: first letter + optional # or b
+            root = name[0]
+            if len(name) > 1 and name[1] in '#b':
+                root += name[1]
+            roots.append(root)
+
+        if not roots:
+            self.estimated_key = None
+            self.key_var.set("--")
+            return
+
+        root_counts = Counter(roots)
+        most_common = root_counts.most_common(3)
+
+        # Simple heuristic: if minor chords dominate, suggest minor key
+        minor_count = sum(1 for c in self.chords if 'm' in c.chord_name.lower() and 'maj' not in c.chord_name.lower())
+        total = len(self.chords)
+
+        top_root = most_common[0][0]
+        if minor_count > total * 0.4:
+            self.estimated_key = f"{top_root}m"
+        else:
+            self.estimated_key = top_root
+
+        self.key_var.set(self.estimated_key)
+
     def _on_zoom_changed(self, zoom: float):
         """Handle zoom level change."""
         # Update zoom percentage display
@@ -1274,7 +1413,8 @@ class ChordEditor:
         filepath = filedialog.asksaveasfilename(
             defaultextension=".json",
             filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
-            initialdir=initial_dir
+            initialdir=initial_dir,
+            initialfile="chords.json"
         )
         if filepath:
             data = {
@@ -1314,15 +1454,74 @@ class ChordEditor:
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to load: {e}")
 
+    def _load_chords_from_midi(self):
+        """Load chords from a MIDI file."""
+        initial_dir = Path(self.audio_file).parent if self.audio_file else None
+        filepath = filedialog.askopenfilename(
+            filetypes=[("MIDI files", "*.mid *.midi"), ("All files", "*.*")],
+            initialdir=initial_dir
+        )
+        if filepath:
+            try:
+                from .midi_loader import load_midi_info
+
+                midi_info = load_midi_info(filepath)
+                midi_chords = midi_info['chords']
+
+                if not midi_chords:
+                    messagebox.showwarning("Warning", "No chords found in MIDI file")
+                    return
+
+                # Convert to EditableChord objects
+                self.chords = []
+                for time, chord_name in midi_chords:
+                    self.chords.append(EditableChord(
+                        start_time=time,
+                        chord_name=chord_name,
+                        id=self._get_next_id()
+                    ))
+
+                self.timeline.set_chords(self.chords)
+                self._update_chord_buttons()
+
+                # Set BPM if found in MIDI
+                if midi_info['bpm']:
+                    self.bpm = midi_info['bpm']
+                    self.bpm_var.set(f"{self.bpm:.1f}")
+                    self.timeline.set_bpm(self.bpm)
+
+                # Estimate key from chords
+                self._estimate_key()
+
+                status_parts = [f"Loaded {len(self.chords)} chords"]
+                if midi_info['bpm']:
+                    status_parts.append(f"BPM: {midi_info['bpm']:.0f}")
+                if self.estimated_key:
+                    status_parts.append(f"Key: {self.estimated_key}")
+                self.status_var.set(f"{' | '.join(status_parts)} from {Path(filepath).name}")
+
+                # Load TTS for new chords if preview is enabled
+                if self.preview_with_chords:
+                    self._load_tts_clips()
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to load MIDI: {e}")
+
     def _export_audio(self):
-        """Export voiced audio."""
+        """Export voiced audio (mixed) and voice-only track."""
         if not self.audio_file or (not self.chords and not self.notes):
             messagebox.showwarning("Warning", "Load audio and add chords/notes first")
             return
 
+        # Generate default filename based on original audio
+        original_name = Path(self.audio_file).stem
+        default_name = f"voiced{original_name}.mp3"
+        initial_dir = Path(self.audio_file).parent
+
         filepath = filedialog.asksaveasfilename(
             defaultextension=".mp3",
-            filetypes=[("MP3 files", "*.mp3"), ("All files", "*.*")]
+            filetypes=[("MP3 files", "*.mp3"), ("All files", "*.*")],
+            initialdir=initial_dir,
+            initialfile=default_name
         )
         if filepath:
             self.status_var.set("Exporting audio...")
@@ -1365,7 +1564,7 @@ class ChordEditor:
                     if spoken and spoken not in tts_clips:
                         tts_clips[spoken] = chord_tts.generate_clip(spoken)
 
-                # Generate TTS clips for notes (Daniel voice)
+                # Generate TTS clips for notes (Moira voice)
                 # Notes use the raw text as both the chord_name and spoken form
                 for note in self.notes:
                     # The note text IS the spoken text
@@ -1384,10 +1583,17 @@ class ChordEditor:
                     channels=original.channels
                 )
 
+                # Export mixed (voiced + original)
                 mixed = mixer.mix_tracks(original, voiced_track, original_volume_db=-3.0)
                 mixer.export(mixed, filepath)
 
-                self.status_var.set(f"Exported to {Path(filepath).name}")
+                # Also export voice-only track
+                filepath_path = Path(filepath)
+                voice_only_name = f"voicedOnly{original_name}{filepath_path.suffix}"
+                voice_only_path = filepath_path.parent / voice_only_name
+                mixer.export(voiced_track, str(voice_only_path))
+
+                self.status_var.set(f"Exported to {filepath_path.name} and {voice_only_name}")
             except Exception as e:
                 messagebox.showerror("Error", f"Export failed: {e}")
                 self.status_var.set("Export failed")

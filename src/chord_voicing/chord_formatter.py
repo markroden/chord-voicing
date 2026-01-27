@@ -78,9 +78,9 @@ QUALITY_MAP = {
 }
 
 # Pattern to parse chord symbols
-# Matches: Root (A-G) + optional accidental (#, b) + optional quality
+# Matches: Root (A-G) + optional accidental (#, b) + optional quality + optional bass note
 CHORD_PATTERN = re.compile(
-    r'^([A-G])(#{1,2}|b{1,2})?(.*)$'
+    r'^([A-G])(#{1,2}|b{1,2})?([^/]*)(?:/([A-G][#b]?))?$'
 )
 
 
@@ -89,10 +89,11 @@ def format_chord(chord_symbol: str) -> Optional[str]:
     Convert a chord symbol to spoken text.
 
     Args:
-        chord_symbol: Chord symbol like "Am7", "F#", "Bbmaj7"
+        chord_symbol: Chord symbol like "Am7", "F#", "Bbmaj7", "C7/Bb"
 
     Returns:
-        Spoken text like "A minor seven", "F sharp major", "B flat major seven"
+        Spoken text like "A minor seven", "F sharp major", "B flat major seven",
+        "C seven, B flat bass"
         Returns None if the chord cannot be parsed or is "N" (no chord)
     """
     if not chord_symbol or chord_symbol.strip() in ('N', 'N.C.', 'NC', ''):
@@ -104,7 +105,7 @@ def format_chord(chord_symbol: str) -> Optional[str]:
     if not match:
         return None
 
-    root, accidental, quality = match.groups()
+    root, accidental, quality, bass_note = match.groups()
 
     # Build the spoken text
     parts = [NOTE_NAMES.get(root, root)]
@@ -126,6 +127,15 @@ def format_chord(chord_symbol: str) -> Optional[str]:
     if spoken_quality:
         parts.append(spoken_quality)
     # If no quality (major chord), just use the note name
+
+    # Add bass note if present (slash chord)
+    if bass_note:
+        bass_root = bass_note[0]
+        bass_acc = bass_note[1:] if len(bass_note) > 1 else ''
+        bass_spoken = NOTE_NAMES.get(bass_root, bass_root)
+        if bass_acc:
+            bass_spoken += ' ' + ACCIDENTALS.get(bass_acc, '')
+        parts.append(f", {bass_spoken} bass")
 
     return ' '.join(parts).strip()
 
