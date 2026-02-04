@@ -46,6 +46,21 @@ class EditableNote:
         return cls(start_time=d['start_time'], text=d['text'], id=id)
 
 
+@dataclass
+class EditableVoiceNote:
+    """A recorded voice note."""
+    start_time: float
+    file_path: str  # Path to the audio file
+    id: int  # Unique identifier for tracking
+
+    def to_dict(self):
+        return {'start_time': self.start_time, 'file_path': self.file_path}
+
+    @classmethod
+    def from_dict(cls, d, id):
+        return cls(start_time=d['start_time'], file_path=d['file_path'], id=id)
+
+
 class AudioPlayer:
     """Audio player using pygame."""
 
@@ -132,8 +147,10 @@ class ChordTimeline(tk.Canvas):
         self.duration: float = 60  # Default duration
         self.chords: List[EditableChord] = []
         self.notes: List[EditableNote] = []
+        self.voice_notes: List[EditableVoiceNote] = []
         self.selected_chord: Optional[EditableChord] = None
         self.selected_note: Optional[EditableNote] = None
+        self.selected_voice_note: Optional[EditableVoiceNote] = None
         self.playhead_pos: float = 0
         self.zoom: float = 1.0  # pixels per second
         self.scroll_offset: float = 0  # time offset for scrolling
@@ -150,6 +167,8 @@ class ChordTimeline(tk.Canvas):
         self.on_note_selected: Optional[Callable] = None
         self.on_note_moved: Optional[Callable] = None
         self.on_note_edited: Optional[Callable] = None
+        self.on_voice_note_selected: Optional[Callable] = None
+        self.on_voice_note_moved: Optional[Callable] = None
         self.on_seek: Optional[Callable] = None
         self.on_zoom_changed: Optional[Callable] = None
 
@@ -157,6 +176,7 @@ class ChordTimeline(tk.Canvas):
         self._dragging = False
         self._drag_chord: Optional[EditableChord] = None
         self._drag_note: Optional[EditableNote] = None
+        self._drag_voice_note: Optional[EditableVoiceNote] = None
         self._drag_offset: float = 0
 
         # Panning state
@@ -189,7 +209,8 @@ class ChordTimeline(tk.Canvas):
         # Colors
         self.bg_color = '#2b2b2b'
         self.chord_color = '#4a9eff'
-        self.note_color = '#ffa500'  # Orange for notes
+        self.note_color = '#ffa500'  # Orange for text notes
+        self.voice_note_color = '#9b59b6'  # Purple for voice notes
         self.selected_color = '#ff6b6b'
         self.playhead_color = '#00ff00'
         self.grid_color = '#444444'
@@ -211,6 +232,11 @@ class ChordTimeline(tk.Canvas):
     def set_notes(self, notes: List[EditableNote]):
         """Set the notes to display."""
         self.notes = sorted(notes, key=lambda n: n.start_time)
+        self.redraw()
+
+    def set_voice_notes(self, voice_notes: List[EditableVoiceNote]):
+        """Set the voice notes to display."""
+        self.voice_notes = sorted(voice_notes, key=lambda v: v.start_time)
         self.redraw()
 
     def set_bpm(self, bpm: Optional[float]):
@@ -416,8 +442,8 @@ class ChordTimeline(tk.Canvas):
                 self.create_text(x, chord_y - 20, text=chord.chord_name,
                                fill=self.text_color, font=('Arial', 10, 'bold'))
 
-        # Draw notes (lower half)
-        note_y = (height * 2) // 3
+        # Draw notes (middle section)
+        note_y = height // 2
         for note in self.notes:
             x = self._time_to_x(note.start_time)
             if 0 <= x <= width:
@@ -429,6 +455,20 @@ class ChordTimeline(tk.Canvas):
                 display_text = note.text[:15] + '...' if len(note.text) > 15 else note.text
                 self.create_text(x, note_y + 20, text=display_text,
                                fill=self.text_color, font=('Arial', 9, 'italic'))
+
+        # Draw voice notes (lower section)
+        voice_y = (height * 3) // 4
+        for voice_note in self.voice_notes:
+            x = self._time_to_x(voice_note.start_time)
+            if 0 <= x <= width:
+                color = self.selected_color if voice_note == self.selected_voice_note else self.voice_note_color
+                # Draw voice note marker (square with mic symbol)
+                self.create_rectangle(x - 8, voice_y - 8, x + 8, voice_y + 8, fill=color, outline='white')
+                self.create_text(x, voice_y, text='🎤', font=('Arial', 10))
+                # Draw filename (truncate)
+                filename = Path(voice_note.file_path).stem[:12]
+                self.create_text(x, voice_y + 18, text=filename,
+                               fill=self.text_color, font=('Arial', 8))
 
         # Draw playhead
         px = self._time_to_x(self.playhead_pos)
@@ -459,11 +499,21 @@ class ChordTimeline(tk.Canvas):
     def _find_note_at(self, x: float, y: float) -> Optional[EditableNote]:
         """Find note at given coordinates."""
         height = self.winfo_height() or 100
-        note_y = (height * 2) // 3
+        note_y = height // 2
         for note in self.notes:
             nx = self._time_to_x(note.start_time)
             if abs(nx - x) < 15 and abs(note_y - y) < 15:
                 return note
+        return None
+
+    def _find_voice_note_at(self, x: float, y: float) -> Optional[EditableVoiceNote]:
+        """Find voice note at given coordinates."""
+        height = self.winfo_height() or 100
+        voice_y = (height * 3) // 4
+        for voice_note in self.voice_notes:
+            vx = self._time_to_x(voice_note.start_time)
+            if abs(vx - x) < 15 and abs(voice_y - y) < 15:
+                return voice_note
         return None
 
     def _on_click(self, event):
@@ -473,9 +523,11 @@ class ChordTimeline(tk.Canvas):
         if chord:
             self.selected_chord = chord
             self.selected_note = None
+            self.selected_voice_note = None
             self._dragging = True
             self._drag_chord = chord
             self._drag_note = None
+            self._drag_voice_note = None
             self._drag_offset = self._time_to_x(chord.start_time) - event.x
             if self.on_chord_selected:
                 self.on_chord_selected(chord)
@@ -487,18 +539,37 @@ class ChordTimeline(tk.Canvas):
         if note:
             self.selected_note = note
             self.selected_chord = None
+            self.selected_voice_note = None
             self._dragging = True
             self._drag_note = note
             self._drag_chord = None
+            self._drag_voice_note = None
             self._drag_offset = self._time_to_x(note.start_time) - event.x
             if self.on_note_selected:
                 self.on_note_selected(note)
             self.redraw()
             return
 
+        # Check for voice note
+        voice_note = self._find_voice_note_at(event.x, event.y)
+        if voice_note:
+            self.selected_voice_note = voice_note
+            self.selected_chord = None
+            self.selected_note = None
+            self._dragging = True
+            self._drag_voice_note = voice_note
+            self._drag_chord = None
+            self._drag_note = None
+            self._drag_offset = self._time_to_x(voice_note.start_time) - event.x
+            if self.on_voice_note_selected:
+                self.on_voice_note_selected(voice_note)
+            self.redraw()
+            return
+
         # Nothing clicked - clear selection and seek
         self.selected_chord = None
         self.selected_note = None
+        self.selected_voice_note = None
         t = self._x_to_time(event.x)
         if 0 <= t <= self.duration and self.on_seek:
             self.on_seek(t)
@@ -515,6 +586,9 @@ class ChordTimeline(tk.Canvas):
             elif self._drag_note:
                 self._drag_note.start_time = new_time
                 self.notes.sort(key=lambda n: n.start_time)
+            elif self._drag_voice_note:
+                self._drag_voice_note.start_time = new_time
+                self.voice_notes.sort(key=lambda v: v.start_time)
             self.redraw()
 
     def _on_release(self, event):
@@ -529,10 +603,15 @@ class ChordTimeline(tk.Canvas):
                 self._drag_note.start_time = self.snap_time_to_beat(self._drag_note.start_time)
                 if self.on_note_moved:
                     self.on_note_moved(self._drag_note)
+            elif self._drag_voice_note:
+                self._drag_voice_note.start_time = self.snap_time_to_beat(self._drag_voice_note.start_time)
+                if self.on_voice_note_moved:
+                    self.on_voice_note_moved(self._drag_voice_note)
             self.redraw()
         self._dragging = False
         self._drag_chord = None
         self._drag_note = None
+        self._drag_voice_note = None
 
     def _on_double_click(self, event):
         """Handle double-click to edit chord or note."""
@@ -576,6 +655,7 @@ class ChordEditor:
         self.player = AudioPlayer()
         self.chords: List[EditableChord] = []
         self.notes: List[EditableNote] = []
+        self.voice_notes: List[EditableVoiceNote] = []
         self.next_id = 0
         self.audio_file: Optional[str] = None
         self.clipboard_chord: Optional[EditableChord] = None
@@ -590,8 +670,10 @@ class ChordEditor:
         self.preview_with_chords: bool = True
         self._tts_clips: dict = {}  # chord_name -> pygame.Sound
         self._note_clips: dict = {}  # note_text -> pygame.Sound
+        self._voice_note_clips: dict = {}  # file_path -> pygame.Sound
         self._announced_chords: set = set()  # chord IDs announced this playback
         self._announced_notes: set = set()  # note IDs announced this playback
+        self._announced_voice_notes: set = set()  # voice note IDs announced this playback
         self._last_position: float = -1  # Start at -1 so items at time 0 get announced
 
         # Pause-for-notes state
@@ -737,6 +819,8 @@ class ChordEditor:
         self.timeline.on_note_selected = self._on_note_selected
         self.timeline.on_note_moved = self._on_note_moved
         self.timeline.on_note_edited = self._on_note_edited
+        self.timeline.on_voice_note_selected = self._on_voice_note_selected
+        self.timeline.on_voice_note_moved = self._on_voice_note_moved
         self.timeline.on_seek = self._on_seek
         self.timeline.on_zoom_changed = self._on_zoom_changed
 
@@ -783,6 +867,7 @@ class ChordEditor:
         self.root.bind_all('<space>', self._on_space)
         self.root.bind('<a>', lambda e: self._add_chord())
         self.root.bind('<n>', lambda e: self._add_note())
+        self.root.bind('<v>', lambda e: self._record_voice_note())
         self.root.bind('<Delete>', lambda e: self._delete_selected())
         self.root.bind('<BackSpace>', lambda e: self._delete_selected())
         self.root.bind('<Command-c>', lambda e: self._copy_selected())
@@ -845,11 +930,13 @@ class ChordEditor:
                 self.player.load(filepath)
                 self.audio_file = filepath
 
-                # Clear existing chords and notes
+                # Clear existing chords, notes, and voice notes
                 self.chords = []
                 self.notes = []
+                self.voice_notes = []
                 self.timeline.set_chords(self.chords)
                 self.timeline.set_notes(self.notes)
+                self.timeline.set_voice_notes(self.voice_notes)
                 self._clear_selection_info()
 
                 self.timeline.set_duration(self.player.duration)
@@ -940,12 +1027,16 @@ class ChordEditor:
         # Reset announcements - mark items before seek position as announced
         self._announced_chords.clear()
         self._announced_notes.clear()
+        self._announced_voice_notes.clear()
         for chord in self.chords:
             if chord.start_time < time:
                 self._announced_chords.add(chord.id)
         for note in self.notes:
             if note.start_time < time:
                 self._announced_notes.add(note.id)
+        for voice_note in self.voice_notes:
+            if voice_note.start_time < time:
+                self._announced_voice_notes.add(voice_note.id)
         self._last_position = time
         self._paused_for_note = False
 
@@ -1071,8 +1162,148 @@ class ChordEditor:
             # Mark as announced so it doesn't double-play
             self._announced_notes.add(new_note.id)
 
+    def _record_voice_note(self):
+        """Record a voice note at playhead position."""
+        if not self.audio_file:
+            messagebox.showwarning("Warning", "Load an audio file first")
+            return
+
+        pos = self.player.get_position()
+
+        # Create voicerecordings directory
+        audio_dir = Path(self.audio_file).parent
+        voice_dir = audio_dir / "voicerecordings"
+        voice_dir.mkdir(exist_ok=True)
+
+        # Generate unique filename
+        timestamp = int(time.time() * 1000)
+        filename = f"voice_{timestamp}.wav"
+        filepath = voice_dir / filename
+
+        # Show recording dialog
+        self._show_recording_dialog(filepath, pos)
+
+    def _show_recording_dialog(self, filepath: Path, position: float):
+        """Show a dialog for recording voice note."""
+        import sounddevice as sd
+        import numpy as np
+        from scipy.io import wavfile
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Record Voice Note")
+        dialog.geometry("300x150")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        # Recording state
+        recording_data = []
+        is_recording = [False]
+        sample_rate = 44100
+
+        ttk.Label(dialog, text="Press Record to start, Stop to finish").pack(pady=10)
+
+        status_var = tk.StringVar(value="Ready")
+        ttk.Label(dialog, textvariable=status_var).pack(pady=5)
+
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(pady=10)
+
+        def start_recording():
+            is_recording[0] = True
+            recording_data.clear()
+            status_var.set("Recording... 🔴")
+            record_btn.config(state='disabled')
+            stop_btn.config(state='normal')
+
+            def callback(indata, frames, time_info, status):
+                if is_recording[0]:
+                    recording_data.append(indata.copy())
+
+            stream = sd.InputStream(samplerate=sample_rate, channels=1, callback=callback)
+            stream.start()
+            dialog.stream = stream
+
+        def stop_recording():
+            is_recording[0] = False
+            if hasattr(dialog, 'stream'):
+                dialog.stream.stop()
+                dialog.stream.close()
+            status_var.set("Stopped")
+            record_btn.config(state='normal')
+            stop_btn.config(state='disabled')
+            save_btn.config(state='normal')
+
+        def save_recording():
+            if recording_data:
+                audio_data = np.concatenate(recording_data, axis=0)
+                wavfile.write(str(filepath), sample_rate, audio_data)
+
+                # Create voice note
+                new_voice_note = EditableVoiceNote(
+                    start_time=position,
+                    file_path=str(filepath),
+                    id=self._get_next_id()
+                )
+                self.voice_notes.append(new_voice_note)
+                self.voice_notes.sort(key=lambda v: v.start_time)
+                self.timeline.set_voice_notes(self.voice_notes)
+                self.timeline.selected_voice_note = new_voice_note
+                self._on_voice_note_selected(new_voice_note)
+
+                # Load the clip for playback
+                if self.preview_with_chords:
+                    self._load_single_voice_clip(str(filepath))
+                    if str(filepath) in self._voice_note_clips:
+                        self._voice_note_clips[str(filepath)].play()
+                    self._announced_voice_notes.add(new_voice_note.id)
+
+                self.status_var.set(f"Voice note saved at {position:.2f}s")
+                dialog.destroy()
+            else:
+                messagebox.showwarning("Warning", "No recording to save")
+
+        def cancel():
+            if is_recording[0]:
+                is_recording[0] = False
+                if hasattr(dialog, 'stream'):
+                    dialog.stream.stop()
+                    dialog.stream.close()
+            dialog.destroy()
+
+        record_btn = ttk.Button(btn_frame, text="🔴 Record", command=start_recording)
+        record_btn.pack(side=tk.LEFT, padx=5)
+
+        stop_btn = ttk.Button(btn_frame, text="⏹ Stop", command=stop_recording, state='disabled')
+        stop_btn.pack(side=tk.LEFT, padx=5)
+
+        save_btn = ttk.Button(btn_frame, text="💾 Save", command=save_recording, state='disabled')
+        save_btn.pack(side=tk.LEFT, padx=5)
+
+        ttk.Button(dialog, text="Cancel", command=cancel).pack(pady=5)
+
+        dialog.protocol("WM_DELETE_WINDOW", cancel)
+
+    def _load_single_voice_clip(self, filepath: str):
+        """Load a voice note clip for playback."""
+        try:
+            self._voice_note_clips[filepath] = pygame.mixer.Sound(filepath)
+        except Exception as e:
+            print(f"Failed to load voice clip {filepath}: {e}")
+
+    def _on_voice_note_selected(self, voice_note: EditableVoiceNote):
+        """Handle voice note selection."""
+        self.selection_type_var.set("Voice")
+        filename = Path(voice_note.file_path).stem
+        self.item_text_var.set(filename)
+        self.item_time_var.set(f"{voice_note.start_time:.2f}")
+        self.item_spoken_var.set("(recorded)")
+
+    def _on_voice_note_moved(self, voice_note: EditableVoiceNote):
+        """Handle voice note moved."""
+        self.item_time_var.set(f"{voice_note.start_time:.2f}")
+
     def _delete_selected(self):
-        """Delete selected chord or note."""
+        """Delete selected chord, note, or voice note."""
         if self.timeline.selected_chord:
             self.chords.remove(self.timeline.selected_chord)
             self.timeline.selected_chord = None
@@ -1086,6 +1317,12 @@ class ChordEditor:
             self.timeline.set_notes(self.notes)
             self._clear_selection_info()
             self.status_var.set("Note deleted")
+        elif self.timeline.selected_voice_note:
+            self.voice_notes.remove(self.timeline.selected_voice_note)
+            self.timeline.selected_voice_note = None
+            self.timeline.set_voice_notes(self.voice_notes)
+            self._clear_selection_info()
+            self.status_var.set("Voice note deleted")
 
     def _delete_chord_at_playhead(self):
         """Delete selected chord, or closest chord to playhead if none selected."""
@@ -1378,15 +1615,24 @@ class ChordEditor:
                 clip.export(temp_path, format="wav")
                 self._note_clips[note_text] = pygame.mixer.Sound(temp_path)
 
-            total = len(self._tts_clips) + len(self._note_clips)
-            self.status_var.set(f"Loaded {total} sounds ({len(self._tts_clips)} chords, {len(self._note_clips)} notes)")
+            # Load voice note clips
+            self._voice_note_clips = {}
+            for voice_note in self.voice_notes:
+                if Path(voice_note.file_path).exists():
+                    try:
+                        self._voice_note_clips[voice_note.file_path] = pygame.mixer.Sound(voice_note.file_path)
+                    except Exception as e:
+                        print(f"Failed to load voice clip {voice_note.file_path}: {e}")
+
+            total = len(self._tts_clips) + len(self._note_clips) + len(self._voice_note_clips)
+            self.status_var.set(f"Loaded {total} sounds ({len(self._tts_clips)} chords, {len(self._note_clips)} notes, {len(self._voice_note_clips)} voice)")
         except Exception as e:
             self.status_var.set(f"Failed to load sounds: {e}")
             self.preview_var.set(False)
             self.preview_with_chords = False
 
     def _check_chord_announcements(self, current_pos: float):
-        """Check if we need to announce any chords or notes at current position."""
+        """Check if we need to announce any chords, notes, or voice notes at current position."""
         # Check chords
         for chord in self.chords:
             if (self._last_position < chord.start_time <= current_pos and
@@ -1400,6 +1646,13 @@ class ChordEditor:
                 note.id not in self._announced_notes):
                 self._announce_note(note)
                 self._announced_notes.add(note.id)
+
+        # Check voice notes
+        for voice_note in self.voice_notes:
+            if (self._last_position < voice_note.start_time <= current_pos and
+                voice_note.id not in self._announced_voice_notes):
+                self._announce_voice_note(voice_note)
+                self._announced_voice_notes.add(voice_note.id)
 
     def _announce_chord(self, chord: EditableChord):
         """Play the TTS clip for a chord."""
@@ -1429,6 +1682,31 @@ class ChordEditor:
                 self._paused_for_note = True
             else:
                 # Just play the note without pausing
+                clip.play()
+
+    def _announce_voice_note(self, voice_note: EditableVoiceNote):
+        """Play a voice note recording."""
+        if voice_note.file_path in self._voice_note_clips:
+            clip = self._voice_note_clips[voice_note.file_path]
+
+            # If pause-for-notes is enabled, pause audio and resume after voice note
+            if self.pause_for_notes_var.get() and self.player.is_playing():
+                # Get current position before pausing
+                self._resume_position = self.player.get_position()
+
+                # Pause the audio
+                self.player.pause()
+                self.play_btn.config(text="▶ Play")
+
+                # Play the voice note
+                clip.play()
+
+                # Calculate when to resume (clip duration + 0.5s pause)
+                clip_duration = clip.get_length()
+                self._note_resume_time = time.time() + clip_duration + 0.5
+                self._paused_for_note = True
+            else:
+                # Just play without pausing
                 clip.play()
 
     def _load_single_tts(self, chord_name: str):
@@ -1476,12 +1754,13 @@ class ChordEditor:
             print(f"Failed to load TTS for note {note_text}: {e}")
 
     def _reset_announcements(self):
-        """Reset announced chords and notes (called on seek/stop)."""
+        """Reset announced chords, notes, and voice notes (called on seek/stop)."""
         self._announced_chords.clear()
         self._announced_notes.clear()
+        self._announced_voice_notes.clear()
 
     def _save_chords(self):
-        """Save chords and notes to JSON file."""
+        """Save chords, notes, and voice notes to JSON file."""
         initial_dir = Path(self.audio_file).parent if self.audio_file else None
         filepath = filedialog.asksaveasfilename(
             defaultextension=".json",
@@ -1494,14 +1773,15 @@ class ChordEditor:
                 'audio_file': self.audio_file,
                 'duration': self.player.duration,
                 'chords': [c.to_dict() for c in self.chords],
-                'notes': [n.to_dict() for n in self.notes]
+                'notes': [n.to_dict() for n in self.notes],
+                'voice_notes': [v.to_dict() for v in self.voice_notes]
             }
             with open(filepath, 'w') as f:
                 json.dump(data, f, indent=2)
             self.status_var.set(f"Saved to {Path(filepath).name}")
 
     def _load_chords(self):
-        """Load chords and notes from JSON file."""
+        """Load chords, notes, and voice notes from JSON file."""
         initial_dir = Path(self.audio_file).parent if self.audio_file else None
         filepath = filedialog.askopenfilename(
             filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
@@ -1520,8 +1800,13 @@ class ChordEditor:
                 for n in data.get('notes', []):
                     self.notes.append(EditableNote.from_dict(n, self._get_next_id()))
 
+                self.voice_notes = []
+                for v in data.get('voice_notes', []):
+                    self.voice_notes.append(EditableVoiceNote.from_dict(v, self._get_next_id()))
+
                 self.timeline.set_chords(self.chords)
                 self.timeline.set_notes(self.notes)
+                self.timeline.set_voice_notes(self.voice_notes)
                 self._update_chord_buttons()
 
                 # Reset announcement tracking
@@ -1532,7 +1817,7 @@ class ChordEditor:
                 if self.preview_with_chords:
                     self._load_tts_clips()
 
-                self.status_var.set(f"Loaded {len(self.chords)} chords, {len(self.notes)} notes from {Path(filepath).name}")
+                self.status_var.set(f"Loaded {len(self.chords)} chords, {len(self.notes)} notes, {len(self.voice_notes)} voice notes from {Path(filepath).name}")
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to load: {e}")
 
@@ -1590,7 +1875,7 @@ class ChordEditor:
 
     def _export_audio(self):
         """Export voiced audio (mixed) and voice-only track."""
-        if not self.audio_file or (not self.chords and not self.notes):
+        if not self.audio_file or (not self.chords and not self.notes and not self.voice_notes):
             messagebox.showwarning("Warning", "Load audio and add chords/notes first")
             return
 
@@ -1652,8 +1937,23 @@ class ChordEditor:
                         spoken_text = note.text.replace('. ', '... ').replace('.', '...')
                         tts_clips[note.text] = note_tts.generate_clip(spoken_text)
 
+                # Load voice note clips
+                from pydub import AudioSegment as PydubSegment
+                for voice_note in self.voice_notes:
+                    if Path(voice_note.file_path).exists():
+                        tts_clips[voice_note.file_path] = PydubSegment.from_file(voice_note.file_path)
+                        # Add voice note as event
+                        events.append(ChordEvent(
+                            start_time=voice_note.start_time,
+                            end_time=voice_note.start_time + 1.0,
+                            chord_name=voice_note.file_path
+                        ))
+
+                # Re-sort events after adding voice notes
+                events.sort(key=lambda e: e.start_time)
+
                 # Debug: print what we're exporting
-                print(f"Exporting {len(self.chords)} chords and {len(self.notes)} notes")
+                print(f"Exporting {len(self.chords)} chords, {len(self.notes)} notes, {len(self.voice_notes)} voice notes")
                 print(f"TTS clips generated: {list(tts_clips.keys())}")
                 print(f"Events: {[(e.start_time, e.chord_name) for e in events]}")
 
@@ -1662,20 +1962,29 @@ class ChordEditor:
                 original = mixer.load_audio(self.audio_file)
 
                 # Check if pause-for-notes is enabled
-                if self.pause_for_notes_var.get() and self.notes:
-                    # Build audio with pauses for notes
+                if self.pause_for_notes_var.get() and (self.notes or self.voice_notes):
+                    # Build audio with pauses for notes and voice notes
                     from pydub import AudioSegment
 
-                    # Sort notes by time
-                    sorted_notes = sorted(self.notes, key=lambda n: n.start_time)
-
-                    # Calculate note durations and build time offset map
+                    # Combine notes and voice notes into one list with their clips
                     note_info = []  # [(original_time, duration_ms, note_clip)]
-                    for note in sorted_notes:
+
+                    # Add text notes
+                    for note in self.notes:
                         if note.text in tts_clips:
                             clip = tts_clips[note.text]
                             duration_ms = len(clip)
                             note_info.append((note.start_time, duration_ms, clip))
+
+                    # Add voice notes
+                    for voice_note in self.voice_notes:
+                        if voice_note.file_path in tts_clips:
+                            clip = tts_clips[voice_note.file_path]
+                            duration_ms = len(clip)
+                            note_info.append((voice_note.start_time, duration_ms, clip))
+
+                    # Sort by time
+                    note_info.sort(key=lambda x: x[0])
 
                     # Build the modified audio with pauses
                     modified_audio = AudioSegment.empty()
@@ -1715,8 +2024,10 @@ class ChordEditor:
 
                     # Adjust chord events based on accumulated offsets
                     for event in events:
-                        # Skip note events (already handled)
+                        # Skip note and voice note events (already handled)
                         if any(n.text == event.chord_name for n in self.notes):
+                            continue
+                        if any(v.file_path == event.chord_name for v in self.voice_notes):
                             continue
 
                         # Calculate time offset for this chord
@@ -1778,13 +2089,14 @@ class ChordEditor:
                 voice_only_path = filepath_path.parent / voice_only_name
                 mixer.export(voiced_track, str(voice_only_path))
 
-                # Auto-save chords/notes JSON
+                # Auto-save chords/notes/voice notes JSON
                 json_path = filepath_path.parent / f"{original_name}_chords.json"
                 data = {
                     'audio_file': self.audio_file,
                     'duration': self.player.duration,
                     'chords': [c.to_dict() for c in self.chords],
-                    'notes': [n.to_dict() for n in self.notes]
+                    'notes': [n.to_dict() for n in self.notes],
+                    'voice_notes': [v.to_dict() for v in self.voice_notes]
                 }
                 with open(json_path, 'w') as f:
                     json.dump(data, f, indent=2)
