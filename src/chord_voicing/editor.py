@@ -594,6 +594,11 @@ class ChordEditor:
         self._announced_notes: set = set()  # note IDs announced this playback
         self._last_position: float = -1  # Start at -1 so items at time 0 get announced
 
+        # Pause-for-notes state
+        self._paused_for_note: bool = False
+        self._note_resume_time: float = 0  # When to resume after note
+        self._resume_position: float = 0  # Position to resume playback from
+
         self._setup_ui()
         self._setup_bindings()
         self._update_loop()
@@ -706,6 +711,15 @@ class ChordEditor:
             takefocus=False
         ).pack(side=tk.LEFT, padx=5)
 
+        ttk.Separator(info_control_frame, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
+
+        self.pause_for_notes_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            info_control_frame, text="Pause for Notes",
+            variable=self.pause_for_notes_var,
+            takefocus=False
+        ).pack(side=tk.LEFT, padx=5)
+
         # Timeline frame with scrollbar
         timeline_frame = ttk.Frame(main_frame)
         timeline_frame.pack(fill=tk.BOTH, expand=True)
@@ -786,6 +800,17 @@ class ChordEditor:
 
     def _update_loop(self):
         """Update loop for playhead position."""
+        # Check if we're paused for a note and should resume
+        if self._paused_for_note:
+            if time.time() >= self._note_resume_time:
+                # Note finished, resume playback
+                self._paused_for_note = False
+                self.player.play(self._resume_position)
+                self.play_btn.config(text="⏸ Pause")
+            # Don't update position while paused for note
+            self.root.after(50, self._update_loop)
+            return
+
         if self.player.is_playing():
             pos = self.player.get_position()
             self.timeline.set_playhead(pos)
@@ -881,7 +906,12 @@ class ChordEditor:
 
     def _toggle_play(self, event=None):
         """Toggle play/pause."""
-        if self.player.is_playing():
+        # If paused for a note, cancel and resume
+        if self._paused_for_note:
+            self._paused_for_note = False
+            self.player.play(self._resume_position)
+            self.play_btn.config(text="⏸ Pause")
+        elif self.player.is_playing():
             self.player.pause()
             self.play_btn.config(text="▶ Play")
         else:
@@ -900,6 +930,7 @@ class ChordEditor:
         self._update_position_display(0)
         self._reset_announcements()
         self._last_position = -1
+        self._paused_for_note = False
 
     def _on_seek(self, time: float):
         """Handle seek from timeline."""
@@ -916,6 +947,7 @@ class ChordEditor:
             if note.start_time < time:
                 self._announced_notes.add(note.id)
         self._last_position = time
+        self._paused_for_note = False
 
     def _on_chord_selected(self, chord: EditableChord):
         """Handle chord selection."""
@@ -1374,7 +1406,27 @@ class ChordEditor:
     def _announce_note(self, note: EditableNote):
         """Play the TTS clip for a note."""
         if note.text in self._note_clips:
-            self._note_clips[note.text].play()
+            clip = self._note_clips[note.text]
+
+            # If pause-for-notes is enabled, pause audio and resume after note
+            if self.pause_for_notes_var.get() and self.player.is_playing():
+                # Get current position before pausing
+                self._resume_position = self.player.get_position()
+
+                # Pause the audio
+                self.player.pause()
+                self.play_btn.config(text="▶ Play")
+
+                # Play the note
+                clip.play()
+
+                # Calculate when to resume (clip duration in seconds + small buffer)
+                clip_duration = clip.get_length()
+                self._note_resume_time = time.time() + clip_duration + 0.1
+                self._paused_for_note = True
+            else:
+                # Just play the note without pausing
+                clip.play()
 
     def _load_single_tts(self, chord_name: str):
         """Load TTS clip for a single chord name."""
@@ -1600,19 +1652,111 @@ class ChordEditor:
                 mixer = AudioMixer(min_gap_seconds=-10.0)
                 original = mixer.load_audio(self.audio_file)
 
-                voiced_track, voiced_items = mixer.create_voiced_track(
-                    duration_ms=len(original),
-                    chord_events=events,
-                    tts_clips=tts_clips,
-                    sample_rate=original.frame_rate,
-                    channels=original.channels
-                )
+                # Check if pause-for-notes is enabled
+                if self.pause_for_notes_var.get() and self.notes:
+                    # Build audio with pauses for notes
+                    from pydub import AudioSegment
 
-                # Debug: print what was actually voiced
-                print(f"Actually voiced: {voiced_items}")
+                    # Sort notes by time
+                    sorted_notes = sorted(self.notes, key=lambda n: n.start_time)
 
-                # Export mixed (voiced + original)
-                mixed = mixer.mix_tracks(original, voiced_track, original_volume_db=-3.0)
+                    # Calculate note durations and build time offset map
+                    note_info = []  # [(original_time, duration_ms, note_clip)]
+                    for note in sorted_notes:
+                        if note.text in tts_clips:
+                            clip = tts_clips[note.text]
+                            duration_ms = len(clip)
+                            note_info.append((note.start_time, duration_ms, clip))
+
+                    # Build the modified audio with pauses
+                    modified_audio = AudioSegment.empty()
+                    voiced_with_pauses = AudioSegment.empty()
+                    last_pos_ms = 0
+                    time_offset = 0  # Accumulated offset from inserted pauses
+
+                    # Also build adjusted chord events
+                    adjusted_events = []
+
+                    for orig_time, duration_ms, note_clip in note_info:
+                        pos_ms = int(orig_time * 1000)
+
+                        # Add audio from last position to this note
+                        if pos_ms > last_pos_ms:
+                            segment = original[last_pos_ms:pos_ms]
+                            modified_audio += segment
+                            # Add silence for the voiced track (chords will be overlaid later)
+                            voiced_with_pauses += AudioSegment.silent(duration=len(segment), frame_rate=original.frame_rate)
+
+                        # Add the note (with silence in original, note in voiced)
+                        modified_audio += AudioSegment.silent(duration=duration_ms, frame_rate=original.frame_rate)
+                        voiced_with_pauses += note_clip
+
+                        # Update offset for events after this note
+                        time_offset += duration_ms / 1000.0
+                        last_pos_ms = pos_ms
+
+                    # Add remaining audio
+                    if last_pos_ms < len(original):
+                        modified_audio += original[last_pos_ms:]
+                        voiced_with_pauses += AudioSegment.silent(duration=len(original) - last_pos_ms, frame_rate=original.frame_rate)
+
+                    # Adjust chord events based on accumulated offsets
+                    for event in events:
+                        # Skip note events (already handled)
+                        if any(n.text == event.chord_name for n in self.notes):
+                            continue
+
+                        # Calculate time offset for this chord
+                        offset = 0
+                        for orig_time, duration_ms, _ in note_info:
+                            if event.start_time > orig_time:
+                                offset += duration_ms / 1000.0
+
+                        adjusted_events.append(ChordEvent(
+                            start_time=event.start_time + offset,
+                            end_time=event.end_time + offset,
+                            chord_name=event.chord_name
+                        ))
+
+                    # Create voiced track for chords only (notes already in voiced_with_pauses)
+                    chord_voiced, _ = mixer.create_voiced_track(
+                        duration_ms=len(modified_audio),
+                        chord_events=adjusted_events,
+                        tts_clips=tts_clips,
+                        sample_rate=original.frame_rate,
+                        channels=original.channels
+                    )
+
+                    # Ensure consistent audio format
+                    voiced_with_pauses = voiced_with_pauses.set_frame_rate(original.frame_rate)
+                    voiced_with_pauses = voiced_with_pauses.set_channels(original.channels)
+                    chord_voiced = chord_voiced.set_frame_rate(original.frame_rate)
+                    chord_voiced = chord_voiced.set_channels(original.channels)
+
+                    # Combine note voices with chord voices
+                    voiced_track = voiced_with_pauses.overlay(chord_voiced)
+
+                    # Mix with modified original
+                    original_adjusted = modified_audio + (- 3.0)  # Apply volume reduction
+                    mixed = original_adjusted.overlay(voiced_track)
+
+                    print(f"Pause-for-notes: inserted {len(note_info)} pauses")
+                else:
+                    # Standard export without pauses
+                    voiced_track, voiced_items = mixer.create_voiced_track(
+                        duration_ms=len(original),
+                        chord_events=events,
+                        tts_clips=tts_clips,
+                        sample_rate=original.frame_rate,
+                        channels=original.channels
+                    )
+
+                    # Debug: print what was actually voiced
+                    print(f"Actually voiced: {voiced_items}")
+
+                    # Export mixed (voiced + original)
+                    mixed = mixer.mix_tracks(original, voiced_track, original_volume_db=-3.0)
+
                 mixer.export(mixed, filepath)
 
                 # Also export voice-only track
