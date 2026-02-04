@@ -640,18 +640,19 @@ class ChordEditor:
         control_frame = ttk.Frame(main_frame)
         control_frame.pack(fill=tk.X, pady=(0, 10))
 
-        self.play_btn = ttk.Button(control_frame, text="▶ Play", command=self._toggle_play)
+        self.play_btn = ttk.Button(control_frame, text="▶ Play", command=self._toggle_play, takefocus=False)
         self.play_btn.pack(side=tk.LEFT, padx=5)
 
-        ttk.Button(control_frame, text="⏹ Stop", command=self._stop).pack(side=tk.LEFT, padx=5)
-        ttk.Button(control_frame, text="🗑 Delete", command=self._delete_chord_at_playhead).pack(side=tk.LEFT, padx=5)
+        ttk.Button(control_frame, text="⏹ Stop", command=self._stop, takefocus=False).pack(side=tk.LEFT, padx=5)
+        ttk.Button(control_frame, text="🗑 Delete", command=self._delete_chord_at_playhead, takefocus=False).pack(side=tk.LEFT, padx=5)
 
         ttk.Separator(control_frame, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
         self.preview_var = tk.BooleanVar(value=True)
         self.preview_check = ttk.Checkbutton(
             control_frame, text="🔊 Hear Chords",
             variable=self.preview_var,
-            command=self._toggle_preview_mode
+            command=self._toggle_preview_mode,
+            takefocus=False
         )
         self.preview_check.pack(side=tk.LEFT, padx=5)
 
@@ -666,11 +667,11 @@ class ChordEditor:
         # Zoom controls
         ttk.Separator(control_frame, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
         ttk.Label(control_frame, text="Zoom:").pack(side=tk.LEFT, padx=(5, 5))
-        ttk.Button(control_frame, text="-", width=3, command=self._zoom_out).pack(side=tk.LEFT)
+        ttk.Button(control_frame, text="-", width=3, command=self._zoom_out, takefocus=False).pack(side=tk.LEFT)
         self.zoom_var = tk.StringVar(value="100%")
         ttk.Label(control_frame, textvariable=self.zoom_var, width=6).pack(side=tk.LEFT, padx=5)
-        ttk.Button(control_frame, text="+", width=3, command=self._zoom_in).pack(side=tk.LEFT)
-        ttk.Button(control_frame, text="Fit", width=4, command=self._zoom_fit).pack(side=tk.LEFT, padx=(5, 0))
+        ttk.Button(control_frame, text="+", width=3, command=self._zoom_in, takefocus=False).pack(side=tk.LEFT)
+        ttk.Button(control_frame, text="Fit", width=4, command=self._zoom_fit, takefocus=False).pack(side=tk.LEFT, padx=(5, 0))
 
         # BPM, Key, and Snap controls (second row)
         info_control_frame = ttk.Frame(main_frame)
@@ -693,14 +694,16 @@ class ChordEditor:
         ttk.Checkbutton(
             info_control_frame, text="Snap to Beat",
             variable=self.snap_var,
-            command=self._toggle_snap
+            command=self._toggle_snap,
+            takefocus=False
         ).pack(side=tk.LEFT, padx=5)
 
         self.grid_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             info_control_frame, text="Show Beat Grid",
             variable=self.grid_var,
-            command=self._toggle_grid
+            command=self._toggle_grid,
+            takefocus=False
         ).pack(side=tk.LEFT, padx=5)
 
         # Timeline frame with scrollbar
@@ -1002,8 +1005,14 @@ class ChordEditor:
         self._update_chord_buttons()
         self.status_var.set(f"Added chord at {pos:.2f}s")
         # Load TTS for new chord if preview is enabled and not already loaded
-        if self.preview_with_chords and "C" not in self._tts_clips:
-            self._load_single_tts("C")
+        if self.preview_with_chords:
+            if "C" not in self._tts_clips:
+                self._load_single_tts("C")
+            # Play it immediately so user hears it
+            if "C" in self._tts_clips:
+                self._tts_clips["C"].play()
+            # Mark as announced so it doesn't double-play
+            self._announced_chords.add(new_chord.id)
 
     def _add_note(self):
         """Add a new note at playhead position."""
@@ -1021,8 +1030,14 @@ class ChordEditor:
         self._on_note_selected(new_note)
         self.status_var.set(f"Added note at {pos:.2f}s")
         # Load TTS for new note if preview is enabled
-        if self.preview_with_chords and note_text not in self._note_clips:
-            self._load_single_note_tts(note_text)
+        if self.preview_with_chords:
+            if note_text not in self._note_clips:
+                self._load_single_note_tts(note_text)
+            # Play it immediately so user hears it
+            if note_text in self._note_clips:
+                self._note_clips[note_text].play()
+            # Mark as announced so it doesn't double-play
+            self._announced_notes.add(new_note.id)
 
     def _delete_selected(self):
         """Delete selected chord or note."""
@@ -1256,7 +1271,8 @@ class ChordEditor:
             btn = ttk.Button(
                 self.chord_buttons_frame,
                 text=chord_name,
-                command=lambda cn=chord_name: self._quick_add_chord(cn)
+                command=lambda cn=chord_name: self._quick_add_chord(cn),
+                takefocus=False
             )
             btn.pack(side=tk.LEFT, padx=2, pady=5)
             self._chord_buttons.append(btn)
@@ -1294,16 +1310,15 @@ class ChordEditor:
 
         try:
             from .chord_formatter import format_chord
-            from .tts_generator import TTSGenerator, VOICE_SAMANTHA, VOICE_MOIRA
+            from .tts_generator import TTSGenerator, VOICE_SAMANTHA
             import tempfile
             import os
 
-            # Use different voices for chords vs notes
-            chord_tts = TTSGenerator(cache_dir="cache", rate=175, voice_id=VOICE_SAMANTHA)
-            note_tts = TTSGenerator(cache_dir="cache", rate=175, voice_id=VOICE_MOIRA)
+            # Use same voice for chords and notes
+            tts = TTSGenerator(cache_dir="cache", rate=175, voice_id=VOICE_SAMANTHA)
             temp_dir = tempfile.mkdtemp()
 
-            # Load chord TTS clips (Samantha voice - female)
+            # Load chord TTS clips
             unique_chord_names = set(c.chord_name for c in self.chords)
             self._tts_clips = {}
 
@@ -1311,18 +1326,18 @@ class ChordEditor:
                 spoken = format_chord(chord_name)
                 if not spoken:
                     continue
-                clip = chord_tts.generate_clip(spoken)
+                clip = tts.generate_clip(spoken)
                 safe_name = chord_name.replace('/', '_').replace('#', 'sharp')
                 temp_path = os.path.join(temp_dir, f"chord_{safe_name}.wav")
                 clip.export(temp_path, format="wav")
                 self._tts_clips[chord_name] = pygame.mixer.Sound(temp_path)
 
-            # Load note TTS clips (Daniel voice - male, British)
+            # Load note TTS clips (same voice as chords)
             unique_note_texts = set(n.text for n in self.notes)
             self._note_clips = {}
 
             for note_text in unique_note_texts:
-                clip = note_tts.generate_clip(note_text)
+                clip = tts.generate_clip(note_text)
                 safe_name = "".join(c if c.isalnum() else '_' for c in note_text[:20])
                 temp_path = os.path.join(temp_dir, f"note_{safe_name}.wav")
                 clip.export(temp_path, format="wav")
@@ -1362,7 +1377,7 @@ class ChordEditor:
             self._note_clips[note.text].play()
 
     def _load_single_tts(self, chord_name: str):
-        """Load TTS clip for a single chord name (Samantha voice)."""
+        """Load TTS clip for a single chord name."""
         try:
             from .chord_formatter import format_chord
             from .tts_generator import TTSGenerator, VOICE_SAMANTHA
@@ -1385,13 +1400,13 @@ class ChordEditor:
             print(f"Failed to load TTS for chord {chord_name}: {e}")
 
     def _load_single_note_tts(self, note_text: str):
-        """Load TTS clip for a single note text (Daniel voice)."""
+        """Load TTS clip for a single note text."""
         try:
-            from .tts_generator import TTSGenerator, VOICE_MOIRA
+            from .tts_generator import TTSGenerator, VOICE_SAMANTHA
             import tempfile
             import os
 
-            tts = TTSGenerator(cache_dir="cache", rate=175, voice_id=VOICE_MOIRA)
+            tts = TTSGenerator(cache_dir="cache", rate=175, voice_id=VOICE_SAMANTHA)
             clip = tts.generate_clip(note_text)
 
             temp_dir = tempfile.mkdtemp()
@@ -1450,6 +1465,15 @@ class ChordEditor:
                 self.timeline.set_chords(self.chords)
                 self.timeline.set_notes(self.notes)
                 self._update_chord_buttons()
+
+                # Reset announcement tracking
+                self._reset_announcements()
+                self._last_position = -1
+
+                # Load TTS clips for preview
+                if self.preview_with_chords:
+                    self._load_tts_clips()
+
                 self.status_var.set(f"Loaded {len(self.chords)} chords, {len(self.notes)} notes from {Path(filepath).name}")
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to load: {e}")
@@ -1529,7 +1553,7 @@ class ChordEditor:
 
             try:
                 from .chord_formatter import format_chord
-                from .tts_generator import TTSGenerator, VOICE_SAMANTHA, VOICE_MOIRA
+                from .tts_generator import TTSGenerator, VOICE_SAMANTHA
                 from .audio_mixer import AudioMixer
 
                 # Convert chords to ChordEvents
@@ -1553,35 +1577,39 @@ class ChordEditor:
                 # Sort all events by start time
                 events.sort(key=lambda e: e.start_time)
 
-                # Generate TTS clips for chords (Samantha voice)
-                # Key must be the SPOKEN text since that's what audio_mixer looks up
-                chord_tts = TTSGenerator(cache_dir="cache", rate=175, voice_id=VOICE_SAMANTHA)
-                note_tts = TTSGenerator(cache_dir="cache", rate=175, voice_id=VOICE_MOIRA)
+                # Generate TTS clips for chords and notes (same voice)
+                tts = TTSGenerator(cache_dir="cache", rate=175, voice_id=VOICE_SAMANTHA)
                 tts_clips = {}
 
                 for chord in self.chords:
                     spoken = format_chord(chord.chord_name)
                     if spoken and spoken not in tts_clips:
-                        tts_clips[spoken] = chord_tts.generate_clip(spoken)
+                        tts_clips[spoken] = tts.generate_clip(spoken)
 
-                # Generate TTS clips for notes (Moira voice)
-                # Notes use the raw text as both the chord_name and spoken form
+                # Generate TTS clips for notes (same voice as chords)
                 for note in self.notes:
-                    # The note text IS the spoken text
                     if note.text not in tts_clips:
-                        tts_clips[note.text] = note_tts.generate_clip(note.text)
+                        tts_clips[note.text] = tts.generate_clip(note.text)
 
-                # Mix audio
-                mixer = AudioMixer()
+                # Debug: print what we're exporting
+                print(f"Exporting {len(self.chords)} chords and {len(self.notes)} notes")
+                print(f"TTS clips generated: {list(tts_clips.keys())}")
+                print(f"Events: {[(e.start_time, e.chord_name) for e in events]}")
+
+                # Mix audio (negative gap allows overlapping - don't skip anything)
+                mixer = AudioMixer(min_gap_seconds=-10.0)
                 original = mixer.load_audio(self.audio_file)
 
-                voiced_track, _ = mixer.create_voiced_track(
+                voiced_track, voiced_items = mixer.create_voiced_track(
                     duration_ms=len(original),
                     chord_events=events,
                     tts_clips=tts_clips,
                     sample_rate=original.frame_rate,
                     channels=original.channels
                 )
+
+                # Debug: print what was actually voiced
+                print(f"Actually voiced: {voiced_items}")
 
                 # Export mixed (voiced + original)
                 mixed = mixer.mix_tracks(original, voiced_track, original_volume_db=-3.0)
@@ -1593,7 +1621,18 @@ class ChordEditor:
                 voice_only_path = filepath_path.parent / voice_only_name
                 mixer.export(voiced_track, str(voice_only_path))
 
-                self.status_var.set(f"Exported to {filepath_path.name} and {voice_only_name}")
+                # Auto-save chords/notes JSON
+                json_path = filepath_path.parent / f"{original_name}_chords.json"
+                data = {
+                    'audio_file': self.audio_file,
+                    'duration': self.player.duration,
+                    'chords': [c.to_dict() for c in self.chords],
+                    'notes': [n.to_dict() for n in self.notes]
+                }
+                with open(json_path, 'w') as f:
+                    json.dump(data, f, indent=2)
+
+                self.status_var.set(f"Exported to {filepath_path.name}, {voice_only_name}, and {json_path.name}")
             except Exception as e:
                 messagebox.showerror("Error", f"Export failed: {e}")
                 self.status_var.set("Export failed")
