@@ -1364,12 +1364,15 @@ class ChordEditor:
                 clip.export(temp_path, format="wav")
                 self._tts_clips[chord_name] = pygame.mixer.Sound(temp_path)
 
-            # Load note TTS clips (same voice as chords)
+            # Load note TTS clips (slower rate for better comprehension)
+            note_tts = TTSGenerator(cache_dir="cache", rate=130, voice_id=VOICE_SAMANTHA)
             unique_note_texts = set(n.text for n in self.notes)
             self._note_clips = {}
 
             for note_text in unique_note_texts:
-                clip = tts.generate_clip(note_text)
+                # Add pauses after periods for better pacing
+                spoken_text = note_text.replace('. ', '... ').replace('.', '...')
+                clip = note_tts.generate_clip(spoken_text)
                 safe_name = "".join(c if c.isalnum() else '_' for c in note_text[:20])
                 temp_path = os.path.join(temp_dir, f"note_{safe_name}.wav")
                 clip.export(temp_path, format="wav")
@@ -1420,9 +1423,9 @@ class ChordEditor:
                 # Play the note
                 clip.play()
 
-                # Calculate when to resume (clip duration in seconds + small buffer)
+                # Calculate when to resume (clip duration + 0.5s pause after note)
                 clip_duration = clip.get_length()
-                self._note_resume_time = time.time() + clip_duration + 0.1
+                self._note_resume_time = time.time() + clip_duration + 0.5
                 self._paused_for_note = True
             else:
                 # Just play the note without pausing
@@ -1452,14 +1455,17 @@ class ChordEditor:
             print(f"Failed to load TTS for chord {chord_name}: {e}")
 
     def _load_single_note_tts(self, note_text: str):
-        """Load TTS clip for a single note text."""
+        """Load TTS clip for a single note text (slower rate for comprehension)."""
         try:
             from .tts_generator import TTSGenerator, VOICE_SAMANTHA
             import tempfile
             import os
 
-            tts = TTSGenerator(cache_dir="cache", rate=175, voice_id=VOICE_SAMANTHA)
-            clip = tts.generate_clip(note_text)
+            # Use slower rate for notes
+            tts = TTSGenerator(cache_dir="cache", rate=130, voice_id=VOICE_SAMANTHA)
+            # Add pauses after periods
+            spoken_text = note_text.replace('. ', '... ').replace('.', '...')
+            clip = tts.generate_clip(spoken_text)
 
             temp_dir = tempfile.mkdtemp()
             safe_name = "".join(c if c.isalnum() else '_' for c in note_text[:20])
@@ -1638,10 +1644,13 @@ class ChordEditor:
                     if spoken and spoken not in tts_clips:
                         tts_clips[spoken] = tts.generate_clip(spoken)
 
-                # Generate TTS clips for notes (same voice as chords)
+                # Generate TTS clips for notes (slower rate for comprehension)
+                note_tts = TTSGenerator(cache_dir="cache", rate=130, voice_id=VOICE_SAMANTHA)
                 for note in self.notes:
                     if note.text not in tts_clips:
-                        tts_clips[note.text] = tts.generate_clip(note.text)
+                        # Add pauses after periods
+                        spoken_text = note.text.replace('. ', '... ').replace('.', '...')
+                        tts_clips[note.text] = note_tts.generate_clip(spoken_text)
 
                 # Debug: print what we're exporting
                 print(f"Exporting {len(self.chords)} chords and {len(self.notes)} notes")
@@ -1688,11 +1697,15 @@ class ChordEditor:
                             voiced_with_pauses += AudioSegment.silent(duration=len(segment), frame_rate=original.frame_rate)
 
                         # Add the note (with silence in original, note in voiced)
-                        modified_audio += AudioSegment.silent(duration=duration_ms, frame_rate=original.frame_rate)
+                        # Include 500ms pause after note for better pacing
+                        pause_after_ms = 500
+                        total_note_duration = duration_ms + pause_after_ms
+                        modified_audio += AudioSegment.silent(duration=total_note_duration, frame_rate=original.frame_rate)
                         voiced_with_pauses += note_clip
+                        voiced_with_pauses += AudioSegment.silent(duration=pause_after_ms, frame_rate=original.frame_rate)
 
                         # Update offset for events after this note
-                        time_offset += duration_ms / 1000.0
+                        time_offset += total_note_duration / 1000.0
                         last_pos_ms = pos_ms
 
                     # Add remaining audio
