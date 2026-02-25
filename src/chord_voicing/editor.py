@@ -149,6 +149,14 @@ class AudioPlayer:
     def is_playing(self) -> bool:
         return self._playing and pygame.mixer.music.get_busy()
 
+    def set_volume(self, volume: float):
+        """Set music volume (0.0 to 1.0)."""
+        pygame.mixer.music.set_volume(max(0.0, min(1.0, volume)))
+
+    def get_volume(self) -> float:
+        """Get current music volume."""
+        return pygame.mixer.music.get_volume()
+
     def cleanup(self):
         pygame.mixer.quit()
 
@@ -186,6 +194,7 @@ class ChordTimeline(tk.Canvas):
         self.on_note_edited: Optional[Callable] = None
         self.on_voice_note_selected: Optional[Callable] = None
         self.on_voice_note_moved: Optional[Callable] = None
+        self.on_voice_note_double_clicked: Optional[Callable] = None
         self.on_image_selected: Optional[Callable] = None
         self.on_image_moved: Optional[Callable] = None
         self.on_seek: Optional[Callable] = None
@@ -720,6 +729,12 @@ class ChordTimeline(tk.Canvas):
                 # Notify editor to load TTS for new note
                 if self.on_note_edited:
                     self.on_note_edited(new_text)
+            return
+
+        voice_note = self._find_voice_note_at(event.x, event.y)
+        if voice_note:
+            if self.on_voice_note_double_clicked:
+                self.on_voice_note_double_clicked(voice_note)
 
     def _on_resize(self, event):
         """Handle resize event."""
@@ -766,6 +781,12 @@ class ChordEditor:
         self._paused_for_note: bool = False
         self._note_resume_time: float = 0  # When to resume after note
         self._resume_position: float = 0  # Position to resume playback from
+
+        # Audio ducking state (lower music volume during voice notes)
+        self._ducked: bool = False
+        self._duck_restore_time: float = 0  # When to restore volume
+        self._duck_volume: float = 0.2  # Volume during voice note
+        self._normal_volume: float = 1.0  # Volume to restore to
 
         self._setup_ui()
         self._setup_bindings()
@@ -909,6 +930,7 @@ class ChordEditor:
         self.timeline.on_note_edited = self._on_note_edited
         self.timeline.on_voice_note_selected = self._on_voice_note_selected
         self.timeline.on_voice_note_moved = self._on_voice_note_moved
+        self.timeline.on_voice_note_double_clicked = self._on_voice_note_double_clicked
         self.timeline.on_image_selected = self._on_image_selected
         self.timeline.on_image_moved = self._on_image_moved
         self.timeline.on_seek = self._on_seek
@@ -984,6 +1006,11 @@ class ChordEditor:
 
     def _update_loop(self):
         """Update loop for playhead position."""
+        # Check if ducked volume should be restored
+        if self._ducked and time.time() >= self._duck_restore_time:
+            self.player.set_volume(self._normal_volume)
+            self._ducked = False
+
         # Check if we're paused for a note and should resume
         if self._paused_for_note:
             if time.time() >= self._note_resume_time:
@@ -1411,6 +1438,16 @@ class ChordEditor:
     def _on_voice_note_moved(self, voice_note: EditableVoiceNote):
         """Handle voice note moved."""
         self.item_time_var.set(f"{voice_note.start_time:.2f}")
+
+    def _on_voice_note_double_clicked(self, voice_note: EditableVoiceNote):
+        """Handle double-click on voice note - play it if not currently playing audio."""
+        if not self.player.is_playing():
+            # Ensure clip is loaded
+            if voice_note.file_path not in self._voice_note_clips:
+                self._load_single_voice_clip(voice_note.file_path)
+            if voice_note.file_path in self._voice_note_clips:
+                self._voice_note_clips[voice_note.file_path].play()
+                self.status_var.set(f"Playing voice note: {Path(voice_note.file_path).stem}")
 
     def _on_image_selected(self, image: EditableImage):
         """Handle image selection."""
@@ -1843,7 +1880,8 @@ class ChordEditor:
 
     def _load_tts_clips(self):
         """Load TTS clips for all current chords and notes as pygame Sound objects."""
-        if not self.chords and not self.notes:
+        if not self.chords and not self.notes and not self.voice_notes:
+            print("[TTS] No chords, notes, or voice notes to load")
             return
 
         self.status_var.set("Loading sounds...")
@@ -1862,16 +1900,19 @@ class ChordEditor:
             # Load chord TTS clips
             unique_chord_names = set(c.chord_name for c in self.chords)
             self._tts_clips = {}
+            print(f"[TTS] Loading {len(unique_chord_names)} unique chord names...")
 
             for chord_name in unique_chord_names:
                 spoken = format_chord(chord_name)
                 if not spoken:
+                    print(f"[TTS]   Skipping chord '{chord_name}' - no spoken form")
                     continue
                 clip = tts.generate_clip(spoken)
                 safe_name = chord_name.replace('/', '_').replace('#', 'sharp')
                 temp_path = os.path.join(temp_dir, f"chord_{safe_name}.wav")
                 clip.export(temp_path, format="wav")
                 self._tts_clips[chord_name] = pygame.mixer.Sound(temp_path)
+                print(f"[TTS]   Loaded chord '{chord_name}' -> '{spoken}'")
 
             # Load note TTS clips (slower rate for better comprehension)
             note_tts = TTSGenerator(cache_dir="cache", rate=130, voice_id=VOICE_SAMANTHA)
@@ -1886,6 +1927,7 @@ class ChordEditor:
                 temp_path = os.path.join(temp_dir, f"note_{safe_name}.wav")
                 clip.export(temp_path, format="wav")
                 self._note_clips[note_text] = pygame.mixer.Sound(temp_path)
+                print(f"[TTS]   Loaded note '{note_text[:30]}'")
 
             # Load voice note clips
             self._voice_note_clips = {}
@@ -1893,12 +1935,19 @@ class ChordEditor:
                 if Path(voice_note.file_path).exists():
                     try:
                         self._voice_note_clips[voice_note.file_path] = pygame.mixer.Sound(voice_note.file_path)
+                        print(f"[TTS]   Loaded voice note: {voice_note.file_path}")
                     except Exception as e:
-                        print(f"Failed to load voice clip {voice_note.file_path}: {e}")
+                        print(f"[TTS]   FAILED voice clip {voice_note.file_path}: {e}")
+                else:
+                    print(f"[TTS]   Voice note file NOT FOUND: {voice_note.file_path}")
 
             total = len(self._tts_clips) + len(self._note_clips) + len(self._voice_note_clips)
+            print(f"[TTS] Total loaded: {total} ({len(self._tts_clips)} chords, {len(self._note_clips)} notes, {len(self._voice_note_clips)} voice)")
             self.status_var.set(f"Loaded {total} sounds ({len(self._tts_clips)} chords, {len(self._note_clips)} notes, {len(self._voice_note_clips)} voice)")
         except Exception as e:
+            print(f"[TTS] FAILED to load sounds: {e}")
+            import traceback
+            traceback.print_exc()
             self.status_var.set(f"Failed to load sounds: {e}")
             self.preview_var.set(False)
             self.preview_with_chords = False
@@ -1936,7 +1985,10 @@ class ChordEditor:
     def _announce_chord(self, chord: EditableChord):
         """Play the TTS clip for a chord."""
         if chord.chord_name in self._tts_clips:
+            print(f"[ANNOUNCE] Playing chord '{chord.chord_name}' at {chord.start_time:.2f}s")
             self._tts_clips[chord.chord_name].play()
+        else:
+            print(f"[ANNOUNCE] No clip for chord '{chord.chord_name}' - available: {list(self._tts_clips.keys())[:5]}")
 
     def _announce_note(self, note: EditableNote):
         """Play the TTS clip for a note."""
@@ -1985,7 +2037,12 @@ class ChordEditor:
                 self._note_resume_time = time.time() + clip_duration + 0.5
                 self._paused_for_note = True
             else:
-                # Just play without pausing
+                # Duck the music volume while voice note plays
+                if self.player.is_playing():
+                    self._normal_volume = self.player.get_volume()
+                    self.player.set_volume(self._duck_volume)
+                    self._ducked = True
+                    self._duck_restore_time = time.time() + clip.get_length() + 0.3
                 clip.play()
 
     def _load_single_tts(self, chord_name: str):
@@ -2100,10 +2157,17 @@ class ChordEditor:
                 self._last_position = -1
 
                 # Load TTS clips for preview
+                tts_status = ""
                 if self.preview_with_chords:
                     self._load_tts_clips()
+                    if self.preview_with_chords:
+                        # TTS succeeded - include clip counts
+                        tts_status = f" | Sounds: {len(self._tts_clips)} chords, {len(self._note_clips)} notes, {len(self._voice_note_clips)} voice"
+                    else:
+                        # TTS failed and disabled preview - show warning
+                        tts_status = " | WARNING: Sound loading failed - check console"
 
-                self.status_var.set(f"Loaded {len(self.chords)} chords, {len(self.notes)} notes, {len(self.voice_notes)} voice notes, {len(self.images)} images from {Path(filepath).name}")
+                self.status_var.set(f"Loaded {len(self.chords)} chords, {len(self.notes)} notes, {len(self.voice_notes)} voice notes, {len(self.images)} images from {Path(filepath).name}{tts_status}")
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to load: {e}")
 
