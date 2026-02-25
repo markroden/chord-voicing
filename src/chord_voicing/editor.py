@@ -235,6 +235,9 @@ class ChordTimeline(tk.Canvas):
         self.bind('<B2-Motion>', self._on_pan_drag)
         self.bind('<ButtonRelease-2>', self._on_pan_end)
 
+        # Compact (sliver) mode
+        self.compact_mode: bool = False
+
         # Colors
         self.bg_color = '#2b2b2b'
         self.chord_color = '#4a9eff'
@@ -437,10 +440,55 @@ class ChordTimeline(tk.Canvas):
         width = self.winfo_width() or 800
         height = self.winfo_height() or 100
 
+        if self.compact_mode:
+            self._redraw_compact(width, height)
+        else:
+            self._redraw_full(width, height)
+
+    def _redraw_compact(self, width: int, height: int):
+        """Redraw timeline in compact sliver mode - all items on one line."""
+        mid_y = height // 2
+
+        # Draw playhead
+        px = self._time_to_x(self.playhead_pos)
+        if 0 <= px <= width:
+            self.create_line(px, 0, px, height, fill=self.playhead_color, width=2)
+
+        # Draw all items as small icons on the center line
+        icon_size = 5
+        for chord in self.chords:
+            x = self._time_to_x(chord.start_time)
+            if 0 <= x <= width:
+                color = self.selected_color if chord == self.selected_chord else self.chord_color
+                self.create_oval(x - icon_size, mid_y - icon_size, x + icon_size, mid_y + icon_size,
+                               fill=color, outline='')
+
+        for note in self.notes:
+            x = self._time_to_x(note.start_time)
+            if 0 <= x <= width:
+                color = self.selected_color if note == self.selected_note else self.note_color
+                self.create_polygon(x, mid_y - icon_size, x + icon_size, mid_y, x, mid_y + icon_size, x - icon_size, mid_y,
+                                   fill=color, outline='')
+
+        for voice_note in self.voice_notes:
+            x = self._time_to_x(voice_note.start_time)
+            if 0 <= x <= width:
+                color = self.selected_color if voice_note == self.selected_voice_note else self.voice_note_color
+                self.create_rectangle(x - icon_size, mid_y - icon_size, x + icon_size, mid_y + icon_size,
+                                     fill=color, outline='')
+
+        for image in self.images:
+            x = self._time_to_x(image.start_time)
+            if 0 <= x <= width:
+                color = self.selected_color if image == self.selected_image else self.image_color
+                self.create_rectangle(x - icon_size, mid_y - icon_size, x + icon_size, mid_y + icon_size,
+                                     fill=color, outline='')
+
+    def _redraw_full(self, width: int, height: int):
+        """Redraw timeline in full mode with all details."""
         # Draw beat grid (if BPM is set and grid is enabled)
         if self.bpm and self.show_grid:
             beat_duration = 60.0 / self.bpm
-            measure_duration = beat_duration * 4  # Assume 4/4 time
             t = 0
             beat_num = 0
             while t <= self.duration:
@@ -499,7 +547,7 @@ class ChordTimeline(tk.Canvas):
                 color = self.selected_color if voice_note == self.selected_voice_note else self.voice_note_color
                 # Draw voice note marker (square with mic symbol)
                 self.create_rectangle(x - 8, voice_y - 8, x + 8, voice_y + 8, fill=color, outline='white')
-                self.create_text(x, voice_y, text='🎤', font=('Arial', 10))
+                self.create_text(x, voice_y, text='\U0001f3a4', font=('Arial', 10))
                 # Draw filename (truncate)
                 filename = Path(voice_note.file_path).stem[:12]
                 self.create_text(x, voice_y + 18, text=filename,
@@ -538,7 +586,7 @@ class ChordTimeline(tk.Canvas):
     def _find_chord_at(self, x: float, y: float) -> Optional[EditableChord]:
         """Find chord at given coordinates."""
         height = self.winfo_height() or 100
-        chord_y = height // 3
+        chord_y = height // 2 if self.compact_mode else height // 3
         for chord in self.chords:
             cx = self._time_to_x(chord.start_time)
             if abs(cx - x) < 15 and abs(chord_y - y) < 15:
@@ -558,7 +606,7 @@ class ChordTimeline(tk.Canvas):
     def _find_voice_note_at(self, x: float, y: float) -> Optional[EditableVoiceNote]:
         """Find voice note at given coordinates."""
         height = self.winfo_height() or 100
-        voice_y = (height * 3) // 4
+        voice_y = height // 2 if self.compact_mode else (height * 3) // 4
         for voice_note in self.voice_notes:
             vx = self._time_to_x(voice_note.start_time)
             if abs(vx - x) < 15 and abs(voice_y - y) < 15:
@@ -568,7 +616,7 @@ class ChordTimeline(tk.Canvas):
     def _find_image_at(self, x: float, y: float) -> Optional[EditableImage]:
         """Find image at given coordinates."""
         height = self.winfo_height() or 100
-        image_y = (height * 7) // 8
+        image_y = height // 2 if self.compact_mode else (height * 7) // 8
         for image in self.images:
             ix = self._time_to_x(image.start_time)
             if abs(ix - x) < 15 and abs(image_y - y) < 15:
@@ -788,6 +836,17 @@ class ChordEditor:
         self._duck_volume: float = 0.2  # Volume during voice note
         self._normal_volume: float = 1.0  # Volume to restore to
 
+        # Fuller screen mode
+        self._fuller_mode: bool = False
+        self._timeline_normal_height: int = 150
+        self._timeline_compact_height: int = 30
+
+        # Auto-save state
+        self._save_path: Optional[str] = None  # Set on manual save or load
+        self._change_count: int = 0  # Changes since last backup
+        self._backup_interval: int = 3  # Backup every N changes
+        self._auto_save_pending: Optional[str] = None  # Scheduled after() ID
+
         self._setup_ui()
         self._setup_bindings()
         self._update_loop()
@@ -827,6 +886,8 @@ class ChordEditor:
         view_menu.add_command(label="Zoom to Fit", command=self._zoom_fit, accelerator="0")
         view_menu.add_separator()
         view_menu.add_command(label="Go to Playhead", command=self._scroll_to_playhead)
+        view_menu.add_separator()
+        view_menu.add_command(label="Toggle Fuller View", command=self._toggle_fuller_mode, accelerator="F")
 
         # Main frame
         main_frame = ttk.Frame(self.root)
@@ -911,17 +972,25 @@ class ChordEditor:
             takefocus=False
         ).pack(side=tk.LEFT, padx=5)
 
-        # Timeline frame with scrollbar
-        timeline_frame = ttk.Frame(main_frame)
-        timeline_frame.pack(fill=tk.BOTH, expand=True)
+        ttk.Separator(info_control_frame, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
+
+        self.fuller_btn = ttk.Button(
+            info_control_frame, text="Fuller View",
+            command=self._toggle_fuller_mode, takefocus=False
+        )
+        self.fuller_btn.pack(side=tk.LEFT, padx=5)
+
+        # Timeline frame with scrollbar (fixed height, does NOT expand)
+        self.timeline_frame = ttk.Frame(main_frame)
+        self.timeline_frame.pack(fill=tk.X)
 
         # Horizontal scrollbar
-        self.h_scrollbar = ttk.Scrollbar(timeline_frame, orient=tk.HORIZONTAL, command=self._on_scroll)
+        self.h_scrollbar = ttk.Scrollbar(self.timeline_frame, orient=tk.HORIZONTAL, command=self._on_scroll)
         self.h_scrollbar.pack(side=tk.BOTTOM, fill=tk.X)
 
         # Timeline
-        self.timeline = ChordTimeline(timeline_frame, height=150)
-        self.timeline.pack(fill=tk.BOTH, expand=True)
+        self.timeline = ChordTimeline(self.timeline_frame, height=self._timeline_normal_height)
+        self.timeline.pack(fill=tk.X)
         self.timeline.on_chord_selected = self._on_chord_selected
         self.timeline.on_chord_moved = self._on_chord_moved
         self.timeline.on_chord_edited = self._on_chord_edited
@@ -936,12 +1005,13 @@ class ChordEditor:
         self.timeline.on_seek = self._on_seek
         self.timeline.on_zoom_changed = self._on_zoom_changed
 
-        # Image display frame (below timeline, hidden by default)
+        # Image display frame (below timeline, expands to fill available space)
         self.image_display_frame = ttk.LabelFrame(main_frame, text="Image")
         self.image_display_label = tk.Label(self.image_display_frame, bg='#1a1a1a')
         self.image_display_label.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        # Start hidden - will be shown when an image is active
-        # (pack is called in _show_image)
+        self.image_display_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+        self._current_source_image = None
+        self.image_display_frame.bind('<Configure>', lambda e: self._resize_current_image())
 
         # Selection info frame
         info_frame = ttk.LabelFrame(main_frame, text="Selected Item")
@@ -989,6 +1059,7 @@ class ChordEditor:
         self.root.bind('<v>', lambda e: self._record_voice_note())
         self.root.bind('<i>', lambda e: self._add_image_from_file())
         self.root.bind('<Shift-I>', lambda e: self._add_image_from_clipboard())
+        self.root.bind('<f>', lambda e: self._toggle_fuller_mode())
         self.root.bind('<Delete>', lambda e: self._delete_selected())
         self.root.bind('<BackSpace>', lambda e: self._delete_selected())
         self.root.bind('<Command-c>', lambda e: self._copy_selected())
@@ -1100,6 +1171,7 @@ class ChordEditor:
             self.timeline.set_chords(self.chords)
             self._update_chord_buttons()
             self.status_var.set(f"Detected {len(self.chords)} chords")
+            self._mark_dirty()
             # Reload TTS clips if preview mode is enabled
             if self.preview_with_chords:
                 self._load_tts_clips()
@@ -1185,6 +1257,7 @@ class ChordEditor:
     def _on_chord_moved(self, chord: EditableChord):
         """Handle chord moved."""
         self.item_time_var.set(f"{chord.start_time:.2f}")
+        self._mark_dirty()
 
     def _on_note_selected(self, note: EditableNote):
         """Handle note selection."""
@@ -1196,17 +1269,20 @@ class ChordEditor:
     def _on_note_moved(self, note: EditableNote):
         """Handle note moved."""
         self.item_time_var.set(f"{note.start_time:.2f}")
+        self._mark_dirty()
 
     def _on_chord_edited(self, chord_name: str):
         """Handle chord edited via double-click - load TTS for new name."""
         if chord_name not in self._tts_clips:
             self._load_single_tts(chord_name)
         self._update_chord_buttons()
+        self._mark_dirty()
 
     def _on_note_edited(self, note_text: str):
         """Handle note edited via double-click - load TTS for new text."""
         if note_text not in self._note_clips:
             self._load_single_note_tts(note_text)
+        self._mark_dirty()
 
     def _update_selected_text(self, event=None):
         """Update text of selected chord or note."""
@@ -1220,28 +1296,36 @@ class ChordEditor:
             if new_text not in self._tts_clips:
                 self._load_single_tts(new_text)
             self._update_chord_buttons()
+            self._mark_dirty()
         elif self.timeline.selected_note:
             self.timeline.selected_note.text = new_text
             self.timeline.redraw()
             # Always load TTS for new note text
             if new_text not in self._note_clips:
                 self._load_single_note_tts(new_text)
+            self._mark_dirty()
 
     def _update_selected_time(self, event=None):
         """Update time of selected chord or note."""
         try:
             new_time = float(self.item_time_var.get())
             new_time = max(0, min(new_time, self.player.duration))
+            changed = False
             if self.timeline.selected_chord:
                 self.timeline.selected_chord.start_time = new_time
                 self.timeline.chords.sort(key=lambda c: c.start_time)
+                changed = True
             elif self.timeline.selected_note:
                 self.timeline.selected_note.start_time = new_time
                 self.timeline.notes.sort(key=lambda n: n.start_time)
+                changed = True
             elif self.timeline.selected_image:
                 self.timeline.selected_image.start_time = new_time
                 self.timeline.images.sort(key=lambda i: i.start_time)
+                changed = True
             self.timeline.redraw()
+            if changed:
+                self._mark_dirty()
         except ValueError:
             pass
 
@@ -1264,6 +1348,7 @@ class ChordEditor:
         self._on_chord_selected(new_chord)
         self._update_chord_buttons()
         self.status_var.set(f"Added chord at {pos:.2f}s")
+        self._mark_dirty()
         # Load TTS for new chord if preview is enabled and not already loaded
         if self.preview_with_chords:
             if "C" not in self._tts_clips:
@@ -1289,6 +1374,7 @@ class ChordEditor:
         self.timeline.selected_chord = None
         self._on_note_selected(new_note)
         self.status_var.set(f"Added note at {pos:.2f}s")
+        self._mark_dirty()
         # Load TTS for new note if preview is enabled
         if self.preview_with_chords:
             if note_text not in self._note_clips:
@@ -1395,6 +1481,7 @@ class ChordEditor:
                     self._announced_voice_notes.add(new_voice_note.id)
 
                 self.status_var.set(f"Voice note saved at {position:.2f}s")
+                self._mark_dirty()
                 dialog.destroy()
             else:
                 messagebox.showwarning("Warning", "No recording to save")
@@ -1438,6 +1525,7 @@ class ChordEditor:
     def _on_voice_note_moved(self, voice_note: EditableVoiceNote):
         """Handle voice note moved."""
         self.item_time_var.set(f"{voice_note.start_time:.2f}")
+        self._mark_dirty()
 
     def _on_voice_note_double_clicked(self, voice_note: EditableVoiceNote):
         """Handle double-click on voice note - play it if not currently playing audio."""
@@ -1462,6 +1550,7 @@ class ChordEditor:
     def _on_image_moved(self, image: EditableImage):
         """Handle image moved."""
         self.item_time_var.set(f"{image.start_time:.2f}")
+        self._mark_dirty()
 
     def _paste_clipboard_image(self, clip_image, pos: float):
         """Save a clipboard image and add it as an image marker."""
@@ -1495,6 +1584,7 @@ class ChordEditor:
         self._on_image_selected(new_image)
         self._announced_images.add(new_image.id)
         self.status_var.set(f"Pasted image at {pos:.2f}s")
+        self._mark_dirty()
 
     def _add_image_from_clipboard(self):
         """Add an image from the system clipboard at the playhead position."""
@@ -1532,6 +1622,7 @@ class ChordEditor:
                 self._on_image_selected(new_image)
                 self._announced_images.add(new_image.id)
                 self.status_var.set(f"Added image from clipboard at {pos:.2f}s")
+                self._mark_dirty()
                 return
 
             if isinstance(clip, PILImage.Image):
@@ -1568,34 +1659,49 @@ class ChordEditor:
         self._on_image_selected(new_image)
         self._announced_images.add(new_image.id)
         self.status_var.set(f"Added image at {pos:.2f}s")
+        self._mark_dirty()
 
     def _show_image(self, image: EditableImage):
-        """Display an image in the image display frame."""
+        """Display an image in the image display frame, scaled to best fill the area."""
         try:
             from PIL import Image, ImageTk
 
             img = Image.open(image.file_path)
+            self._current_source_image = img.copy()
 
-            # Resize to fit display frame while maintaining aspect ratio
-            max_width = max(self.root.winfo_width() - 40, 400)
-            max_height = 300
-            img.thumbnail((max_width, max_height), Image.LANCZOS)
-
-            photo = ImageTk.PhotoImage(img)
-            self.image_display_label.configure(image=photo)
-            self._current_display_image = photo  # Prevent garbage collection
-
-            # Show the frame if hidden
-            if not self.image_display_frame.winfo_manager():
-                self.image_display_frame.pack(fill=tk.X, pady=(10, 0))
+            self._resize_current_image()
         except Exception as e:
             self.status_var.set(f"Failed to display image: {e}")
 
+    def _resize_current_image(self):
+        """Resize the current source image to best fill the display area."""
+        if not hasattr(self, '_current_source_image') or self._current_source_image is None:
+            return
+        try:
+            from PIL import Image, ImageTk
+
+            img = self._current_source_image
+            avail_w = max(self.image_display_frame.winfo_width() - 20, 100)
+            avail_h = max(self.image_display_frame.winfo_height() - 30, 100)
+            img_w, img_h = img.size
+
+            # Scale to best fill available area while keeping aspect ratio
+            scale = min(avail_w / img_w, avail_h / img_h)
+            new_w = max(1, int(img_w * scale))
+            new_h = max(1, int(img_h * scale))
+
+            resized = img.resize((new_w, new_h), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(resized)
+            self.image_display_label.configure(image=photo)
+            self._current_display_image = photo
+        except Exception:
+            pass
+
     def _hide_image_display(self):
-        """Hide the image display frame."""
-        self.image_display_frame.pack_forget()
+        """Clear the image display."""
         self.image_display_label.configure(image='')
         self._current_display_image = None
+        self._current_source_image = None
 
     def _delete_selected(self):
         """Delete selected chord, note, or voice note."""
@@ -1606,18 +1712,21 @@ class ChordEditor:
             self._update_chord_buttons()
             self._clear_selection_info()
             self.status_var.set("Chord deleted")
+            self._mark_dirty()
         elif self.timeline.selected_note:
             self.notes.remove(self.timeline.selected_note)
             self.timeline.selected_note = None
             self.timeline.set_notes(self.notes)
             self._clear_selection_info()
             self.status_var.set("Note deleted")
+            self._mark_dirty()
         elif self.timeline.selected_voice_note:
             self.voice_notes.remove(self.timeline.selected_voice_note)
             self.timeline.selected_voice_note = None
             self.timeline.set_voice_notes(self.voice_notes)
             self._clear_selection_info()
             self.status_var.set("Voice note deleted")
+            self._mark_dirty()
         elif self.timeline.selected_image:
             self.images.remove(self.timeline.selected_image)
             self.timeline.selected_image = None
@@ -1625,6 +1734,7 @@ class ChordEditor:
             self._clear_selection_info()
             self._hide_image_display()
             self.status_var.set("Image deleted")
+            self._mark_dirty()
 
     def _delete_chord_at_playhead(self):
         """Delete selected chord, or closest chord to playhead if none selected."""
@@ -1645,6 +1755,7 @@ class ChordEditor:
         self._update_chord_buttons()
         self._clear_selection_info()
         self.status_var.set(f"Deleted {closest.chord_name} at {closest.start_time:.2f}s")
+        self._mark_dirty()
 
     def _copy_selected(self):
         """Copy selected chord or note."""
@@ -1679,6 +1790,7 @@ class ChordEditor:
             self.timeline.set_chords(self.chords)
             self._update_chord_buttons()
             self.status_var.set(f"Pasted chord: {new_chord.chord_name} at {pos:.2f}s")
+            self._mark_dirty()
         elif self.clipboard_note:
             new_note = EditableNote(
                 start_time=pos,
@@ -1689,6 +1801,7 @@ class ChordEditor:
             self.notes.sort(key=lambda n: n.start_time)
             self.timeline.set_notes(self.notes)
             self.status_var.set(f"Pasted note at {pos:.2f}s")
+            self._mark_dirty()
 
     def _nudge(self, delta: float):
         """Nudge selected chord or note by delta seconds."""
@@ -1699,6 +1812,7 @@ class ChordEditor:
             self.item_time_var.set(f"{new_time:.2f}")
             self.timeline.chords.sort(key=lambda c: c.start_time)
             self.timeline.redraw()
+            self._mark_dirty()
         elif self.timeline.selected_note:
             new_time = self.timeline.selected_note.start_time + delta
             new_time = max(0, min(new_time, self.player.duration))
@@ -1706,6 +1820,7 @@ class ChordEditor:
             self.item_time_var.set(f"{new_time:.2f}")
             self.timeline.notes.sort(key=lambda n: n.start_time)
             self.timeline.redraw()
+            self._mark_dirty()
         elif self.timeline.selected_image:
             new_time = self.timeline.selected_image.start_time + delta
             new_time = max(0, min(new_time, self.player.duration))
@@ -1713,6 +1828,7 @@ class ChordEditor:
             self.item_time_var.set(f"{new_time:.2f}")
             self.timeline.images.sort(key=lambda i: i.start_time)
             self.timeline.redraw()
+            self._mark_dirty()
 
     def _zoom_in(self):
         """Zoom in on the timeline."""
@@ -1748,6 +1864,19 @@ class ChordEditor:
     def _toggle_grid(self):
         """Toggle beat grid visibility."""
         self.timeline.show_grid = self.grid_var.get()
+        self.timeline.redraw()
+
+    def _toggle_fuller_mode(self):
+        """Toggle fuller screen mode - shrinks timeline to a sliver."""
+        self._fuller_mode = not self._fuller_mode
+        if self._fuller_mode:
+            self.fuller_btn.config(text="Normal View")
+            self.timeline.compact_mode = True
+            self.timeline.configure(height=self._timeline_compact_height)
+        else:
+            self.fuller_btn.config(text="Fuller View")
+            self.timeline.compact_mode = False
+            self.timeline.configure(height=self._timeline_normal_height)
         self.timeline.redraw()
 
     def _estimate_key(self):
@@ -1868,6 +1997,7 @@ class ChordEditor:
         if chord_name not in self._tts_clips:
             self._load_single_tts(chord_name)
         self.status_var.set(f"Added {chord_name} at {pos:.2f}s")
+        self._mark_dirty()
 
     def _toggle_preview_mode(self):
         """Toggle chord preview mode."""
@@ -2096,6 +2226,76 @@ class ChordEditor:
         self._announced_voice_notes.clear()
         self._announced_images.clear()
 
+    def _get_save_data(self) -> dict:
+        """Build the save data dictionary."""
+        return {
+            'audio_file': self.audio_file,
+            'duration': self.player.duration,
+            'chords': [c.to_dict() for c in self.chords],
+            'notes': [n.to_dict() for n in self.notes],
+            'voice_notes': [v.to_dict() for v in self.voice_notes],
+            'images': [i.to_dict() for i in self.images]
+        }
+
+    def _save_to_file(self, filepath: str):
+        """Write save data to a file."""
+        with open(filepath, 'w') as f:
+            json.dump(self._get_save_data(), f, indent=2)
+
+    def _rotate_backups(self):
+        """Rotate backup files: .2backup -> .3backup, .1backup -> .2backup, current -> .1backup."""
+        if not self._save_path:
+            return
+        p = Path(self._save_path)
+        b3 = p.with_suffix(p.suffix + '.3backup')
+        b2 = p.with_suffix(p.suffix + '.2backup')
+        b1 = p.with_suffix(p.suffix + '.1backup')
+
+        # Rotate: .2backup -> .3backup
+        if b2.exists():
+            import shutil
+            shutil.copy2(str(b2), str(b3))
+        # .1backup -> .2backup
+        if b1.exists():
+            import shutil
+            shutil.copy2(str(b1), str(b2))
+        # current -> .1backup
+        if p.exists():
+            import shutil
+            shutil.copy2(str(p), str(b1))
+
+    def _mark_dirty(self):
+        """Mark data as changed. Debounces auto-save to 1 second after last change."""
+        if not self._save_path:
+            # Derive save path from audio file if possible
+            if self.audio_file:
+                audio_path = Path(self.audio_file)
+                self._save_path = str(audio_path.parent / f"{audio_path.stem}_chords.json")
+            else:
+                return
+
+        self._change_count += 1
+
+        # Cancel any pending auto-save and schedule a new one
+        if self._auto_save_pending:
+            self.root.after_cancel(self._auto_save_pending)
+        self._auto_save_pending = self.root.after(1000, self._do_auto_save)
+
+    def _do_auto_save(self):
+        """Perform the actual auto-save (called after debounce delay)."""
+        self._auto_save_pending = None
+        if not self._save_path:
+            return
+
+        # Rotate backups every N changes
+        if self._change_count % self._backup_interval == 0:
+            self._rotate_backups()
+
+        try:
+            self._save_to_file(self._save_path)
+        except Exception as e:
+            print(f"[AUTO-SAVE] Failed: {e}")
+
     def _save_chords(self):
         """Save chords, notes, and voice notes to JSON file."""
         initial_dir = Path(self.audio_file).parent if self.audio_file else None
@@ -2106,16 +2306,8 @@ class ChordEditor:
             initialfile="chords.json"
         )
         if filepath:
-            data = {
-                'audio_file': self.audio_file,
-                'duration': self.player.duration,
-                'chords': [c.to_dict() for c in self.chords],
-                'notes': [n.to_dict() for n in self.notes],
-                'voice_notes': [v.to_dict() for v in self.voice_notes],
-                'images': [i.to_dict() for i in self.images]
-            }
-            with open(filepath, 'w') as f:
-                json.dump(data, f, indent=2)
+            self._save_path = filepath
+            self._save_to_file(filepath)
             self.status_var.set(f"Saved to {Path(filepath).name}")
 
     def _load_chords(self):
@@ -2127,6 +2319,8 @@ class ChordEditor:
         )
         if filepath:
             try:
+                self._save_path = filepath
+                self._change_count = 0
                 with open(filepath, 'r') as f:
                     data = json.load(f)
 
@@ -2217,6 +2411,7 @@ class ChordEditor:
                     status_parts.append(f"Key: {self.estimated_key}")
                 self.status_var.set(f"{' | '.join(status_parts)} from {Path(filepath).name}")
 
+                self._mark_dirty()
                 # Load TTS for new chords if preview is enabled
                 if self.preview_with_chords:
                     self._load_tts_clips()
