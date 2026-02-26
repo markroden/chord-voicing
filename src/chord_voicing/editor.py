@@ -819,7 +819,8 @@ class ChordEditor:
         self.voice_notes: List[EditableVoiceNote] = []
         self.images: List[EditableImage] = []
         self.next_id = 0
-        self.audio_file: Optional[str] = None
+        self.audio_files: List[str] = []
+        self.active_audio_index: int = 0
         self.clipboard_chord: Optional[EditableChord] = None
         self.clipboard_note: Optional[EditableNote] = None
 
@@ -866,6 +867,13 @@ class ChordEditor:
         self._setup_bindings()
         self._update_loop()
 
+    @property
+    def audio_file(self) -> Optional[str]:
+        """Active audio file path (backward compat)."""
+        if self.audio_files and 0 <= self.active_audio_index < len(self.audio_files):
+            return self.audio_files[self.active_audio_index]
+        return None
+
     def _setup_ui(self):
         """Setup the UI components."""
         # Menu bar
@@ -875,6 +883,7 @@ class ChordEditor:
         file_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="File", menu=file_menu)
         file_menu.add_command(label="Open Audio...", command=self._open_audio, accelerator="Cmd+O")
+        file_menu.add_command(label="Add Audio File...", command=self._add_audio_file)
         file_menu.add_command(label="Load Chords...", command=self._load_chords)
         file_menu.add_command(label="Load Chords from MIDI...", command=self._load_chords_from_midi)
         file_menu.add_command(label="Save Chords...", command=self._save_chords, accelerator="Cmd+S")
@@ -994,6 +1003,22 @@ class ChordEditor:
             command=self._toggle_fuller_mode, takefocus=False
         )
         self.fuller_btn.pack(side=tk.LEFT, padx=5)
+
+        # Audio files panel
+        audio_files_frame = ttk.LabelFrame(main_frame, text="Audio Files")
+        audio_files_frame.pack(fill=tk.X, pady=(5, 5))
+
+        self.audio_listbox = tk.Listbox(audio_files_frame, height=3, selectmode=tk.SINGLE)
+        audio_scrollbar = ttk.Scrollbar(audio_files_frame, orient=tk.VERTICAL, command=self.audio_listbox.yview)
+        self.audio_listbox.config(yscrollcommand=audio_scrollbar.set)
+        self.audio_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 0), pady=5)
+        audio_scrollbar.pack(side=tk.LEFT, fill=tk.Y, pady=5)
+        self.audio_listbox.bind('<<ListboxSelect>>', self._on_audio_file_selected)
+
+        audio_btn_frame = ttk.Frame(audio_files_frame)
+        audio_btn_frame.pack(side=tk.LEFT, padx=5, pady=5)
+        ttk.Button(audio_btn_frame, text="Add...", command=self._add_audio_file, takefocus=False).pack(fill=tk.X, pady=2)
+        ttk.Button(audio_btn_frame, text="Remove", command=self._remove_audio_file, takefocus=False).pack(fill=tk.X, pady=2)
 
         # Timeline frame with scrollbar (fixed height, does NOT expand)
         self.timeline_frame = ttk.Frame(main_frame)
@@ -1132,16 +1157,91 @@ class ChordEditor:
         secs = dur % 60
         return f"{mins}:{secs:04.1f}"
 
+    def _refresh_audio_listbox(self):
+        """Redraw the audio files listbox from self.audio_files."""
+        self.audio_listbox.delete(0, tk.END)
+        for i, path in enumerate(self.audio_files):
+            prefix = ">> " if i == self.active_audio_index else "   "
+            self.audio_listbox.insert(tk.END, f"{prefix}{Path(path).name}")
+        if self.audio_files:
+            self.audio_listbox.selection_set(self.active_audio_index)
+
+    def _switch_audio(self, index: int):
+        """Switch the active audio file by index."""
+        if not self.audio_files or index < 0 or index >= len(self.audio_files):
+            return
+        filepath = self.audio_files[index]
+        try:
+            # Preserve playhead position
+            old_pos = self.player.get_position() if self.player.loaded_file else 0
+            was_playing = self.player._playing
+
+            if was_playing:
+                self.player.pause()
+
+            self.player.load(filepath)
+            self.active_audio_index = index
+
+            # Clamp position to new duration
+            new_pos = min(old_pos, self.player.duration)
+            self.player.seek(new_pos)
+
+            self.timeline.set_duration(self.player.duration)
+            self.duration_var.set(self._format_duration(self.player.duration))
+            self._update_scrollbar()
+            self._on_zoom_changed(self.timeline.zoom)
+            self._refresh_audio_listbox()
+            self.status_var.set(f"Active: {Path(filepath).name}")
+
+            if was_playing:
+                self.player.play(new_pos)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load audio: {e}")
+
+    def _add_audio_file(self):
+        """Add an audio file to the list via file dialog."""
+        filepath = filedialog.askopenfilename(
+            filetypes=[("Audio files", "*.mp3 *.wav *.m4a *.ogg"), ("All files", "*.*")]
+        )
+        if filepath:
+            if filepath in self.audio_files:
+                messagebox.showinfo("Info", "This audio file is already in the list.")
+                return
+            self.audio_files.append(filepath)
+            self._switch_audio(len(self.audio_files) - 1)
+            self._mark_dirty()
+
+    def _remove_audio_file(self):
+        """Remove the selected audio file from the list."""
+        sel = self.audio_listbox.curselection()
+        if not sel:
+            return
+        index = sel[0]
+        if len(self.audio_files) <= 1:
+            messagebox.showwarning("Warning", "Cannot remove the last audio file.")
+            return
+        self.audio_files.pop(index)
+        # Switch to a valid index
+        new_index = min(index, len(self.audio_files) - 1)
+        self._switch_audio(new_index)
+        self._mark_dirty()
+
+    def _on_audio_file_selected(self, event):
+        """Handle listbox selection change."""
+        sel = self.audio_listbox.curselection()
+        if not sel:
+            return
+        index = sel[0]
+        if index != self.active_audio_index:
+            self._switch_audio(index)
+
     def _open_audio(self):
-        """Open an audio file."""
+        """Open an audio file (new project — clears everything)."""
         filepath = filedialog.askopenfilename(
             filetypes=[("Audio files", "*.mp3 *.wav *.m4a *.ogg"), ("All files", "*.*")]
         )
         if filepath:
             try:
-                self.player.load(filepath)
-                self.audio_file = filepath
-
                 # Clear existing chords, notes, voice notes, and images
                 self.chords = []
                 self.notes = []
@@ -1154,10 +1254,11 @@ class ChordEditor:
                 self._clear_selection_info()
                 self._hide_image_display()
 
-                self.timeline.set_duration(self.player.duration)
-                self.duration_var.set(self._format_duration(self.player.duration))
-                self._update_scrollbar()
-                self._on_zoom_changed(self.timeline.zoom)
+                # Reset audio files to just this one
+                self.audio_files = [filepath]
+                self._save_path = None
+                self._change_count = 0
+                self._switch_audio(0)
                 self.status_var.set(f"Loaded: {Path(filepath).name}")
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to load audio: {e}")
@@ -1408,8 +1509,8 @@ class ChordEditor:
 
         pos = self.player.get_position()
 
-        # Create voicerecordings directory
-        audio_dir = Path(self.audio_file).parent
+        # Create voicerecordings directory (use first audio file for stable path)
+        audio_dir = Path(self.audio_files[0]).parent
         voice_dir = audio_dir / "voicerecordings"
         voice_dir.mkdir(exist_ok=True)
 
@@ -1573,8 +1674,8 @@ class ChordEditor:
             messagebox.showwarning("Warning", "Load an audio file first")
             return
 
-        # Create images directory
-        audio_dir = Path(self.audio_file).parent
+        # Create images directory (use first audio file for stable path)
+        audio_dir = Path(self.audio_files[0]).parent
         image_dir = audio_dir / "images"
         image_dir.mkdir(exist_ok=True)
 
@@ -2244,7 +2345,9 @@ class ChordEditor:
     def _get_save_data(self) -> dict:
         """Build the save data dictionary."""
         return {
-            'audio_file': self.audio_file,
+            'audio_file': self.audio_file,  # backward compat
+            'audio_files': list(self.audio_files),
+            'active_audio_index': self.active_audio_index,
             'duration': self.player.duration,
             'chords': [c.to_dict() for c in self.chords],
             'notes': [n.to_dict() for n in self.notes],
@@ -2282,9 +2385,9 @@ class ChordEditor:
     def _mark_dirty(self):
         """Mark data as changed. Debounces auto-save to 1 second after last change."""
         if not self._save_path:
-            # Derive save path from audio file if possible
-            if self.audio_file:
-                audio_path = Path(self.audio_file)
+            # Derive save path from first audio file for stable path
+            if self.audio_files:
+                audio_path = Path(self.audio_files[0])
                 self._save_path = str(audio_path.parent / f"{audio_path.stem}_chords.json")
             else:
                 return
@@ -2338,6 +2441,28 @@ class ChordEditor:
                 self._change_count = 0
                 with open(filepath, 'r') as f:
                     data = json.load(f)
+
+                # Load audio files (backward compat: wrap single audio_file)
+                if 'audio_files' in data:
+                    loaded_files = data['audio_files']
+                elif data.get('audio_file'):
+                    loaded_files = [data['audio_file']]
+                else:
+                    loaded_files = []
+
+                # Check for missing files
+                missing = [f for f in loaded_files if not Path(f).exists()]
+                valid_files = [f for f in loaded_files if Path(f).exists()]
+                if missing:
+                    names = "\n".join(Path(f).name for f in missing)
+                    messagebox.showwarning("Missing Audio", f"Audio files not found:\n{names}")
+
+                if valid_files:
+                    self.audio_files = valid_files
+                    target_index = data.get('active_audio_index', 0)
+                    # Clamp index to valid range after filtering missing files
+                    target_index = min(target_index, len(self.audio_files) - 1)
+                    self._switch_audio(target_index)
 
                 self.chords = []
                 for c in data.get('chords', []):
@@ -2439,10 +2564,10 @@ class ChordEditor:
             messagebox.showwarning("Warning", "Load audio and add chords/notes first")
             return
 
-        # Generate default filename based on original audio
-        original_name = Path(self.audio_file).stem
+        # Generate default filename based on first audio file (stable reference)
+        original_name = Path(self.audio_files[0]).stem
         default_name = f"voiced{original_name}.mp3"
-        initial_dir = Path(self.audio_file).parent
+        initial_dir = Path(self.audio_files[0]).parent
 
         filepath = filedialog.asksaveasfilename(
             defaultextension=".mp3",
@@ -2651,14 +2776,7 @@ class ChordEditor:
 
                 # Auto-save chords/notes/voice notes/images JSON
                 json_path = filepath_path.parent / f"{original_name}_chords.json"
-                data = {
-                    'audio_file': self.audio_file,
-                    'duration': self.player.duration,
-                    'chords': [c.to_dict() for c in self.chords],
-                    'notes': [n.to_dict() for n in self.notes],
-                    'voice_notes': [v.to_dict() for v in self.voice_notes],
-                    'images': [i.to_dict() for i in self.images]
-                }
+                data = self._get_save_data()
                 with open(json_path, 'w') as f:
                     json.dump(data, f, indent=2)
 
