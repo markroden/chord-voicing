@@ -625,6 +625,19 @@ class ChordTimeline(tk.Canvas):
 
     def _on_click(self, event):
         """Handle click event."""
+        # In compact mode, clicks only move the playhead
+        if self.compact_mode:
+            self.selected_chord = None
+            self.selected_note = None
+            self.selected_voice_note = None
+            self.selected_image = None
+            t = self._x_to_time(event.x)
+            t = max(0, min(t, self.duration))
+            if self.on_seek:
+                self.on_seek(t)
+            self.redraw()
+            return
+
         # Check for chord first
         chord = self._find_chord_at(event.x, event.y)
         if chord:
@@ -709,6 +722,8 @@ class ChordTimeline(tk.Canvas):
 
     def _on_drag(self, event):
         """Handle drag event."""
+        if self.compact_mode:
+            return
         if self._dragging:
             new_time = self._x_to_time(event.x + self._drag_offset)
             new_time = max(0, min(new_time, self.duration))
