@@ -8,6 +8,7 @@ from dataclasses import dataclass, asdict
 from typing import List, Optional, Callable
 import threading
 import time
+import subprocess
 
 # Audio playback
 import pygame
@@ -889,6 +890,7 @@ class ChordEditor:
         file_menu.add_command(label="Save Chords...", command=self._save_chords, accelerator="Cmd+S")
         file_menu.add_separator()
         file_menu.add_command(label="Export Voiced Audio...", command=self._export_audio)
+        file_menu.add_command(label="Export Video...", command=self._export_video)
         file_menu.add_separator()
         file_menu.add_command(label="Detect Chords", command=self._detect_chords)
 
@@ -2784,6 +2786,276 @@ class ChordEditor:
             except Exception as e:
                 messagebox.showerror("Error", f"Export failed: {e}")
                 self.status_var.set("Export failed")
+
+    def _export_video(self):
+        """Export an MP4 video with images, chord/note overlays, and progress bar."""
+        if not self.audio_file:
+            messagebox.showwarning("Warning", "Load an audio file first")
+            return
+
+        # Check ffmpeg availability
+        try:
+            subprocess.run(
+                ['ffmpeg', '-version'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                check=True
+            )
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            messagebox.showerror(
+                "ffmpeg Not Found",
+                "ffmpeg is required for video export.\n\n"
+                "Install with:\n  brew install ffmpeg\n\n"
+                "Or download from https://ffmpeg.org"
+            )
+            return
+
+        original_name = Path(self.audio_files[0]).stem
+        default_name = f"{original_name}_video.mp4"
+        initial_dir = Path(self.audio_files[0]).parent
+
+        filepath = filedialog.asksaveasfilename(
+            defaultextension=".mp4",
+            filetypes=[("MP4 files", "*.mp4"), ("All files", "*.*")],
+            initialdir=initial_dir,
+            initialfile=default_name
+        )
+        if not filepath:
+            return
+
+        self._export_video_cancel = False
+        duration = self.player.duration
+        fps = 24
+
+        t = threading.Thread(
+            target=self._run_video_export,
+            args=(filepath, duration, fps),
+            daemon=True
+        )
+        t.start()
+
+    def _render_video_frame(self, current_time, duration, image_cache):
+        """Render a single video frame as a PIL Image (1920x1080)."""
+        from PIL import Image, ImageDraw, ImageFont
+
+        WIDTH, HEIGHT = 1920, 1080
+        frame = Image.new('RGB', (WIDTH, HEIGHT), (0, 0, 0))
+
+        # Find active image (last image with start_time <= current_time)
+        active_image = None
+        for img in self.images:
+            if img.start_time <= current_time:
+                active_image = img
+            else:
+                break
+
+        if active_image and active_image.file_path in image_cache:
+            bg = image_cache[active_image.file_path]
+            # Center the pre-scaled image
+            x = (WIDTH - bg.width) // 2
+            y = (HEIGHT - bg.height) // 2
+            frame.paste(bg, (x, y))
+
+        # Find current chord (last chord with start_time <= current_time)
+        current_chord = None
+        for chord in self.chords:
+            if chord.start_time <= current_time:
+                current_chord = chord
+            else:
+                break
+
+        # Find current note (last note with start_time <= current_time, within 5s window)
+        current_note = None
+        for note in self.notes:
+            if note.start_time <= current_time:
+                current_note = note
+            else:
+                break
+        # Only show note if within 5 seconds of its start
+        if current_note and (current_time - current_note.start_time) > 5.0:
+            current_note = None
+
+        # Load fonts with fallback
+        def load_font(size):
+            for name in [
+                '/System/Library/Fonts/Helvetica.ttc',
+                '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+            ]:
+                try:
+                    return ImageFont.truetype(name, size)
+                except (OSError, IOError):
+                    continue
+            return ImageFont.load_default()
+
+        font_chord = load_font(60)
+        font_note = load_font(36)
+        font_time = load_font(24)
+
+        # Draw overlay bar if there's a chord or note to show
+        if current_chord or current_note:
+            overlay = Image.new('RGBA', (WIDTH, 80), (0, 0, 0, 160))
+            overlay_draw = ImageDraw.Draw(overlay)
+
+            if current_chord:
+                overlay_draw.text(
+                    (30, 8), current_chord.chord_name,
+                    fill=(74, 158, 255, 255), font=font_chord
+                )
+
+            if current_note:
+                bbox = overlay_draw.textbbox((0, 0), current_note.text, font=font_note)
+                text_w = bbox[2] - bbox[0]
+                overlay_draw.text(
+                    (WIDTH - text_w - 30, 22), current_note.text,
+                    fill=(255, 165, 0, 255), font=font_note
+                )
+
+            # Composite overlay onto frame
+            frame_rgba = frame.convert('RGBA')
+            frame_rgba.paste(overlay, (0, HEIGHT - 80 - 30), overlay)
+            frame = frame_rgba.convert('RGB')
+
+        # Progress bar
+        draw = ImageDraw.Draw(frame)
+        bar_y = HEIGHT - 20
+        bar_h = 8
+        progress = current_time / max(duration, 0.001)
+
+        # Gray track
+        draw.rectangle(
+            [0, bar_y, WIDTH, bar_y + bar_h],
+            fill=(60, 60, 60)
+        )
+        # Green fill
+        draw.rectangle(
+            [0, bar_y, int(WIDTH * progress), bar_y + bar_h],
+            fill=(0, 200, 80)
+        )
+
+        # Time labels
+        elapsed = self._format_duration(current_time)
+        total = self._format_duration(duration)
+        draw.text((10, bar_y - 18), elapsed, fill=(200, 200, 200), font=font_time)
+        bbox = draw.textbbox((0, 0), total, font=font_time)
+        tw = bbox[2] - bbox[0]
+        draw.text((WIDTH - tw - 10, bar_y - 18), total, fill=(200, 200, 200), font=font_time)
+
+        return frame
+
+    def _run_video_export(self, filepath, duration, fps):
+        """Background worker that renders frames and pipes them to ffmpeg."""
+        from PIL import Image
+
+        WIDTH, HEIGHT = 1920, 1080
+
+        self.root.after(0, lambda: self.status_var.set("Preparing video export..."))
+
+        # Pre-load and pre-scale all images
+        image_cache = {}
+        for img in self.images:
+            try:
+                pil_img = Image.open(img.file_path)
+                pil_img = pil_img.convert('RGB')
+                # Scale to fit within frame while preserving aspect ratio
+                img_ratio = pil_img.width / pil_img.height
+                frame_ratio = WIDTH / HEIGHT
+                if img_ratio > frame_ratio:
+                    # Image is wider — fit to width, letterbox top/bottom
+                    new_w = WIDTH
+                    new_h = int(WIDTH / img_ratio)
+                else:
+                    # Image is taller — fit to height, pillarbox left/right
+                    new_h = HEIGHT
+                    new_w = int(HEIGHT * img_ratio)
+                pil_img = pil_img.resize((new_w, new_h), Image.LANCZOS)
+                image_cache[img.file_path] = pil_img
+            except Exception as e:
+                print(f"Warning: could not load image {img.file_path}: {e}")
+
+        total_frames = int(duration * fps)
+        if total_frames <= 0:
+            self.root.after(0, lambda: messagebox.showwarning("Warning", "Audio duration is zero"))
+            return
+
+        # Start ffmpeg
+        cmd = [
+            'ffmpeg', '-y',
+            '-f', 'rawvideo',
+            '-vcodec', 'rawvideo',
+            '-s', f'{WIDTH}x{HEIGHT}',
+            '-pix_fmt', 'rgb24',
+            '-r', str(fps),
+            '-i', '-',
+            '-i', self.audio_file,
+            '-c:v', 'libx264',
+            '-preset', 'medium',
+            '-crf', '23',
+            '-pix_fmt', 'yuv420p',
+            '-c:a', 'aac',
+            '-b:a', '192k',
+            '-shortest',
+            '-movflags', '+faststart',
+            filepath
+        ]
+
+        process = None
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE
+            )
+
+            last_status_update = 0
+            for i in range(total_frames):
+                if self._export_video_cancel:
+                    self.root.after(0, lambda: self.status_var.set("Video export cancelled"))
+                    break
+
+                current_time = i / fps
+                frame = self._render_video_frame(current_time, duration, image_cache)
+                try:
+                    process.stdin.write(frame.tobytes())
+                except BrokenPipeError:
+                    stderr_out = process.stderr.read().decode(errors='replace')
+                    err_msg = f"ffmpeg stopped unexpectedly:\n{stderr_out[-500:]}"
+                    self.root.after(0, lambda m=err_msg: messagebox.showerror("Export Error", m))
+                    return
+
+                # Update status every ~1 second of video
+                current_sec = int(current_time)
+                if current_sec > last_status_update:
+                    last_status_update = current_sec
+                    pct = int((i / total_frames) * 100)
+                    msg = f"Exporting video... {pct}% ({self._format_duration(current_time)} / {self._format_duration(duration)})"
+                    self.root.after(0, lambda m=msg: self.status_var.set(m))
+
+            process.stdin.close()
+            process.wait(timeout=30)
+
+            if process.returncode != 0:
+                stderr_out = process.stderr.read().decode(errors='replace')
+                err_msg = f"ffmpeg exited with code {process.returncode}:\n{stderr_out[-500:]}"
+                self.root.after(0, lambda m=err_msg: messagebox.showerror("Export Error", m))
+            elif not self._export_video_cancel:
+                out_name = Path(filepath).name
+                self.root.after(0, lambda: self.status_var.set(f"Video exported to {out_name}"))
+                self.root.after(0, lambda: messagebox.showinfo("Export Complete", f"Video saved to:\n{filepath}"))
+
+        except Exception as e:
+            err_msg = f"Video export failed: {e}"
+            self.root.after(0, lambda m=err_msg: messagebox.showerror("Export Error", m))
+            self.root.after(0, lambda: self.status_var.set("Video export failed"))
+        finally:
+            if process:
+                try:
+                    process.stdin.close()
+                except Exception:
+                    pass
+                try:
+                    process.terminate()
+                except Exception:
+                    pass
 
     def run(self):
         """Run the editor."""
